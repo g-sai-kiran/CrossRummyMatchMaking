@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cross-rummy-matchmaking",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-31",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MATCHMAKER",
+        "class_name": "Matchmaker"
+      },
+      {
+        "name": "GAME_ROOM",
+        "class_name": "GameRoom",
+        "script_name": "board-game-server"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Matchmaker"]
+    }
+  ]
+}
