@@ -23,6 +23,8 @@ When enough players are available:
 7. A short-lived match-result record is kept for 10 minutes so every waiting client can poll and receive the same `gameId` and its own WebSocket URL.
 8. The client connects directly to `board-game-server` using the returned `websocketUrl`.
 
+Queued tickets use a **30-second lease**. Calling the status endpoint refreshes the lease. If a player closes the app, loses connection, or otherwise stops polling, the ticket expires automatically and is removed from matchmaking, so an abandoned player cannot be matched later.
+
 The `board-game-server` binding is configured as a cross-Worker Durable Object binding in `wrangler.jsonc`.
 
 ## API
@@ -84,6 +86,8 @@ A queued client should poll using the `pollAfterMs` value returned by the server
 GET /matchmake/status?ticketId=<ticketId>
 ```
 
+Each successful queued status poll refreshes the ticket's 30-second lease.
+
 Queued response:
 
 ```json
@@ -105,6 +109,8 @@ Matched response:
   "websocketUrl": "wss://board-game-server.g-saikirangoud99740.workers.dev/ws?gameId=1d21...&playerId=player-123"
 }
 ```
+
+If the client stops polling for 30 seconds while still queued, the ticket expires. A later status request returns `404` and the client should create a new matchmaking request.
 
 After a match is created, the queue ticket itself is already removed. The status endpoint reads the temporary delivery record, which expires automatically after 10 minutes.
 
@@ -277,6 +283,15 @@ public class MatchmakingClient : MonoBehaviour
             using var request = UnityWebRequest.Get(url);
             yield return request.SendWebRequest();
 
+            if (request.responseCode == 404)
+            {
+                // The queued ticket lease expired. Stop polling and create a
+                // fresh matchmaking request if the user is still searching.
+                currentTicketId = null;
+                pollingRoutine = null;
+                yield break;
+            }
+
             if (request.result != UnityWebRequest.Result.Success)
             {
                 Debug.LogWarning($"Match status failed: {request.responseCode} {request.downloadHandler.text}");
@@ -370,6 +385,8 @@ curl -X POST http://localhost:8787/matchmake \
 ```
 
 The second request should return `matched`. Poll player 1's ticket and it should return the same `gameId`.
+
+To test abandoned-ticket cleanup, queue a player and then stop polling. After more than 30 seconds, `GET /matchmake/status?ticketId=...` should return `404`.
 
 A request with `gameType: 1` or a different `playerCount` must not join that match.
 
