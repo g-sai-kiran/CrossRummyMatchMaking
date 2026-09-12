@@ -59,6 +59,18 @@ interface LegacyTicket extends MatchRequest {
   status: "queued" | "matching" | "matched" | "cancelled";
 }
 
+interface GamePlayerSummary {
+  id: string;
+}
+
+interface GameStateSummary {
+  gameId: string;
+  status: number;
+  gameType: GameType;
+  playerCount: number;
+  players: GamePlayerSummary[];
+}
+
 interface GameRoomStub {
   createGame(
     gameId: string,
@@ -67,7 +79,10 @@ interface GameRoomStub {
     gameType: GameType
   ): Promise<unknown>;
   addPlayer(playerId: string): Promise<unknown>;
+  getGameState(): Promise<GameStateSummary | null>;
   clearGame(): Promise<void>;
+  listRegisteredGameIds(): Promise<string[]>;
+  unregisterGameId(gameId: string): Promise<void>;
 }
 
 export interface Env {
@@ -78,6 +93,8 @@ export interface Env {
 }
 
 const MATCHMAKER_NAME = "global";
+const GAME_REGISTRY_NAME = "__game_registry__";
+const GAME_STATUS_FINISHED = 2;
 const POLL_AFTER_MS = 1_000;
 const QUEUED_TICKET_TTL_MS = 30_000;
 const MATCH_RESULT_TTL_MS = 10 * 60_000;
@@ -158,6 +175,14 @@ export class Matchmaker extends DurableObject<Env> {
     const changed = this.removeExpiredTickets(now) || this.removeExpiredResults(now);
     if (changed) {
       await this.saveState();
+    }
+
+    // Reconnect takes priority over creating a new matchmaking ticket. If this
+    // player still belongs to a Waiting/Playing GameRoom, return that room so a
+    // refresh, app restart, or temporary disconnect never creates a second game.
+    const runningGame = await this.findRunningGameForPlayer(request.playerId);
+    if (runningGame) {
+      return await this.resumeRunningGame(request.playerId, runningGame);
     }
 
     const existing = this.findActiveTicketForPlayer(request.playerId);
@@ -361,6 +386,76 @@ export class Matchmaker extends DurableObject<Env> {
     }
   }
 
+  private async findRunningGameForPlayer(playerId: string): Promise<GameStateSummary | null> {
+    const registry = this.env.GAME_ROOM.getByName(GAME_REGISTRY_NAME) as unknown as GameRoomStub;
+    const gameIds = await registry.listRegisteredGameIds();
+
+    for (const gameId of gameIds) {
+      const room = this.env.GAME_ROOM.getByName(gameId) as unknown as GameRoomStub;
+      const state = await room.getGameState();
+
+      if (!state) {
+        await registry.unregisterGameId(gameId);
+        continue;
+      }
+
+      if (state.status === GAME_STATUS_FINISHED) {
+        continue;
+      }
+
+      if (state.players.some(player => player.id === playerId)) {
+        return state;
+      }
+    }
+
+    return null;
+  }
+
+  private async resumeRunningGame(
+    playerId: string,
+    state: GameStateSummary
+  ): Promise<MatchedResponse> {
+    // A player who already has a game must not stay in the queue as well.
+    for (const [ticketId, ticket] of this.tickets) {
+      if (ticket.playerId === playerId && ticket.status === "queued") {
+        this.tickets.delete(ticketId);
+      }
+    }
+
+    // Keep only the newest delivery record for this player. Delivery records
+    // are short-lived and exist only so the normal matched response contract
+    // stays identical when reconnecting.
+    for (const [ticketId, result] of this.results) {
+      if (result.playerId === playerId) {
+        this.results.delete(ticketId);
+      }
+    }
+
+    const now = Date.now();
+    const ticketId = crypto.randomUUID();
+    const players = state.players.map(player => player.id);
+    const result: MatchResult = {
+      ticketId,
+      playerId,
+      status: "matched",
+      gameId: state.gameId,
+      players,
+      websocketUrl: buildGameWebSocketUrl(
+        this.env.GAME_SERVER_URL,
+        state.gameId,
+        playerId
+      ),
+      matchedAt: now,
+      expiresAt: now + MATCH_RESULT_TTL_MS
+    };
+
+    this.results.set(ticketId, result);
+    await this.saveState();
+    await this.scheduleCleanupAlarm();
+
+    return this.toMatchedResponse(result);
+  }
+
   private findActiveTicketForPlayer(playerId: string): Ticket | undefined {
     return [...this.tickets.values()].find(ticket => ticket.playerId === playerId);
   }
@@ -376,7 +471,7 @@ export class Matchmaker extends DurableObject<Env> {
   private toMatchedResponse(result: MatchResult): MatchedResponse {
     return {
       ticketId: result.ticketId,
-      status: "matched",
+      status: result.status,
       gameId: result.gameId,
       players: result.players,
       websocketUrl: result.websocketUrl
