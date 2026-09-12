@@ -16,6 +16,7 @@ type TicketStatus = "queued" | "matching";
 interface Ticket extends MatchRequest {
   ticketId: string;
   createdAt: number;
+  lastSeenAt: number;
   status: TicketStatus;
 }
 
@@ -54,7 +55,20 @@ interface PersistedState {
 interface LegacyTicket extends MatchRequest {
   ticketId: string;
   createdAt: number;
-  status: "queued" | "matched" | "cancelled";
+  lastSeenAt?: number;
+  status: "queued" | "matching" | "matched" | "cancelled";
+}
+
+interface GamePlayerSummary {
+  id: string;
+}
+
+interface GameStateSummary {
+  gameId: string;
+  status: number;
+  gameType: GameType;
+  playerCount: number;
+  players: GamePlayerSummary[];
 }
 
 interface GameRoomStub {
@@ -65,7 +79,10 @@ interface GameRoomStub {
     gameType: GameType
   ): Promise<unknown>;
   addPlayer(playerId: string): Promise<unknown>;
+  getGameState(): Promise<GameStateSummary | null>;
   clearGame(): Promise<void>;
+  listRegisteredGameIds(): Promise<string[]>;
+  unregisterGameId(gameId: string): Promise<void>;
 }
 
 export interface Env {
@@ -76,7 +93,10 @@ export interface Env {
 }
 
 const MATCHMAKER_NAME = "global";
+const GAME_REGISTRY_NAME = "__game_registry__";
+const GAME_STATUS_FINISHED = 2;
 const POLL_AFTER_MS = 1_000;
+const QUEUED_TICKET_TTL_MS = 30_000;
 const MATCH_RESULT_TTL_MS = 10 * 60_000;
 const STATE_KEY = "state";
 const LEGACY_TICKETS_KEY = "tickets";
@@ -99,14 +119,15 @@ export class Matchmaker extends DurableObject<Env> {
         const legacy = await ctx.storage.get<Record<string, LegacyTicket>>(LEGACY_TICKETS_KEY);
         if (legacy) {
           for (const [ticketId, ticket] of Object.entries(legacy)) {
-            if (ticket.status === "queued") {
+            if (ticket.status === "queued" || ticket.status === "matching") {
               this.tickets.set(ticketId, {
                 ticketId,
                 playerId: ticket.playerId,
                 gameType: ticket.gameType,
                 playerCount: ticket.playerCount,
                 createdAt: ticket.createdAt,
-                status: "queued"
+                lastSeenAt: ticket.lastSeenAt ?? ticket.createdAt,
+                status: ticket.status === "matching" ? "matching" : "queued"
               });
             }
           }
@@ -114,16 +135,27 @@ export class Matchmaker extends DurableObject<Env> {
         }
       }
 
-      // A Worker restart can interrupt a match while it is being created.
-      // Put any reserved tickets back into the queue so they do not get stuck.
+      // State written by the previous matchmaking version does not contain
+      // lastSeenAt. Treat createdAt as the last heartbeat for migration.
       for (const ticket of this.tickets.values()) {
+        if (!Number.isFinite(ticket.lastSeenAt)) {
+          ticket.lastSeenAt = ticket.createdAt;
+          shouldSave = true;
+        }
+
+        // A Worker restart can interrupt a match while it is being created.
+        // Put any reserved tickets back into the queue so they do not get stuck.
         if (ticket.status === "matching") {
           ticket.status = "queued";
           shouldSave = true;
         }
       }
 
-      if (this.removeExpiredResults(Date.now())) {
+      const now = Date.now();
+      if (this.removeExpiredTickets(now)) {
+        shouldSave = true;
+      }
+      if (this.removeExpiredResults(now)) {
         shouldSave = true;
       }
 
@@ -132,13 +164,26 @@ export class Matchmaker extends DurableObject<Env> {
         await ctx.storage.delete(LEGACY_TICKETS_KEY);
       }
 
-      await this.scheduleResultCleanup();
+      await this.scheduleCleanupAlarm();
     });
   }
 
   async enqueue(request: MatchRequest): Promise<MatchResponse> {
     validateRequest(request);
-    this.removeExpiredResults(Date.now());
+
+    const now = Date.now();
+    const changed = this.removeExpiredTickets(now) || this.removeExpiredResults(now);
+    if (changed) {
+      await this.saveState();
+    }
+
+    // Reconnect takes priority over creating a new matchmaking ticket. If this
+    // player still belongs to a Waiting/Playing GameRoom, return that room so a
+    // refresh, app restart, or temporary disconnect never creates a second game.
+    const runningGame = await this.findRunningGameForPlayer(request.playerId);
+    if (runningGame) {
+      return await this.resumeRunningGame(request.playerId, runningGame);
+    }
 
     const existing = this.findActiveTicketForPlayer(request.playerId);
     if (existing) {
@@ -146,6 +191,10 @@ export class Matchmaker extends DurableObject<Env> {
         existing.gameType === request.gameType &&
         existing.playerCount === request.playerCount
       ) {
+        existing.lastSeenAt = now;
+        await this.saveState();
+        await this.scheduleCleanupAlarm();
+
         if (existing.status === "queued") {
           await this.tryCreateMatch(existing);
           const existingResult = this.results.get(existing.ticketId);
@@ -167,12 +216,14 @@ export class Matchmaker extends DurableObject<Env> {
     const ticket: Ticket = {
       ...request,
       ticketId: crypto.randomUUID(),
-      createdAt: Date.now(),
+      createdAt: now,
+      lastSeenAt: now,
       status: "queued"
     };
 
     this.tickets.set(ticket.ticketId, ticket);
     await this.saveState();
+    await this.scheduleCleanupAlarm();
 
     await this.tryCreateMatch(ticket);
 
@@ -191,20 +242,28 @@ export class Matchmaker extends DurableObject<Env> {
 
   async getStatus(ticketId: string): Promise<MatchResponse | null> {
     const now = Date.now();
-    if (this.removeExpiredResults(now)) {
+    const changed = this.removeExpiredTickets(now) || this.removeExpiredResults(now);
+    if (changed) {
       await this.saveState();
-      await this.scheduleResultCleanup();
     }
 
     const result = this.results.get(ticketId);
     if (result) {
+      await this.scheduleCleanupAlarm();
       return this.toMatchedResponse(result);
     }
 
     const ticket = this.tickets.get(ticketId);
     if (!ticket) {
+      await this.scheduleCleanupAlarm();
       return null;
     }
+
+    // Polling is the queued-ticket heartbeat. If the app/browser disappears,
+    // polling stops and the ticket expires automatically after 30 seconds.
+    ticket.lastSeenAt = now;
+    await this.saveState();
+    await this.scheduleCleanupAlarm();
 
     if (ticket.status === "queued") {
       await this.tryCreateMatch(ticket);
@@ -234,26 +293,38 @@ export class Matchmaker extends DurableObject<Env> {
 
     this.tickets.delete(ticketId);
     await this.saveState();
+    await this.scheduleCleanupAlarm();
     return "cancelled";
   }
 
   async alarm(): Promise<void> {
-    if (this.removeExpiredResults(Date.now())) {
+    const now = Date.now();
+    const changed = this.removeExpiredTickets(now) || this.removeExpiredResults(now);
+
+    if (changed) {
       await this.saveState();
     }
-    await this.scheduleResultCleanup();
+
+    await this.scheduleCleanupAlarm();
   }
 
   private async tryCreateMatch(newTicket: Ticket): Promise<void> {
+    const now = Date.now();
+    if (this.removeExpiredTickets(now)) {
+      await this.saveState();
+    }
+
     const candidates = [...this.tickets.values()]
       .filter(ticket =>
         ticket.status === "queued" &&
         ticket.gameType === newTicket.gameType &&
-        ticket.playerCount === newTicket.playerCount
+        ticket.playerCount === newTicket.playerCount &&
+        now - ticket.lastSeenAt < QUEUED_TICKET_TTL_MS
       )
       .sort((a, b) => a.createdAt - b.createdAt);
 
     if (candidates.length < newTicket.playerCount) {
+      await this.scheduleCleanupAlarm();
       return;
     }
 
@@ -294,13 +365,16 @@ export class Matchmaker extends DurableObject<Env> {
       // The queue tickets are now gone. Only short-lived delivery records remain,
       // so clients that were waiting can poll once more and receive the game info.
       await this.saveState();
-      await this.scheduleResultCleanup();
+      await this.scheduleCleanupAlarm();
     } catch (error) {
+      const retryAt = Date.now();
       for (const ticket of matched) {
         ticket.status = "queued";
+        ticket.lastSeenAt = retryAt;
         this.tickets.set(ticket.ticketId, ticket);
       }
       await this.saveState();
+      await this.scheduleCleanupAlarm();
 
       try {
         await room.clearGame();
@@ -310,6 +384,76 @@ export class Matchmaker extends DurableObject<Env> {
 
       throw error;
     }
+  }
+
+  private async findRunningGameForPlayer(playerId: string): Promise<GameStateSummary | null> {
+    const registry = this.env.GAME_ROOM.getByName(GAME_REGISTRY_NAME) as unknown as GameRoomStub;
+    const gameIds = await registry.listRegisteredGameIds();
+
+    for (const gameId of gameIds) {
+      const room = this.env.GAME_ROOM.getByName(gameId) as unknown as GameRoomStub;
+      const state = await room.getGameState();
+
+      if (!state) {
+        await registry.unregisterGameId(gameId);
+        continue;
+      }
+
+      if (state.status === GAME_STATUS_FINISHED) {
+        continue;
+      }
+
+      if (state.players.some(player => player.id === playerId)) {
+        return state;
+      }
+    }
+
+    return null;
+  }
+
+  private async resumeRunningGame(
+    playerId: string,
+    state: GameStateSummary
+  ): Promise<MatchedResponse> {
+    // A player who already has a game must not stay in the queue as well.
+    for (const [ticketId, ticket] of this.tickets) {
+      if (ticket.playerId === playerId && ticket.status === "queued") {
+        this.tickets.delete(ticketId);
+      }
+    }
+
+    // Keep only the newest delivery record for this player. Delivery records
+    // are short-lived and exist only so the normal matched response contract
+    // stays identical when reconnecting.
+    for (const [ticketId, result] of this.results) {
+      if (result.playerId === playerId) {
+        this.results.delete(ticketId);
+      }
+    }
+
+    const now = Date.now();
+    const ticketId = crypto.randomUUID();
+    const players = state.players.map(player => player.id);
+    const result: MatchResult = {
+      ticketId,
+      playerId,
+      status: "matched",
+      gameId: state.gameId,
+      players,
+      websocketUrl: buildGameWebSocketUrl(
+        this.env.GAME_SERVER_URL,
+        state.gameId,
+        playerId
+      ),
+      matchedAt: now,
+      expiresAt: now + MATCH_RESULT_TTL_MS
+    };
+
+    this.results.set(ticketId, result);
+    await this.saveState();
+    await this.scheduleCleanupAlarm();
+
+    return this.toMatchedResponse(result);
   }
 
   private findActiveTicketForPlayer(playerId: string): Ticket | undefined {
@@ -327,11 +471,27 @@ export class Matchmaker extends DurableObject<Env> {
   private toMatchedResponse(result: MatchResult): MatchedResponse {
     return {
       ticketId: result.ticketId,
-      status: "matched",
+      status: result.status,
       gameId: result.gameId,
       players: result.players,
       websocketUrl: result.websocketUrl
     };
+  }
+
+  private removeExpiredTickets(now: number): boolean {
+    let removed = false;
+
+    for (const [ticketId, ticket] of this.tickets) {
+      if (
+        ticket.status === "queued" &&
+        now - ticket.lastSeenAt >= QUEUED_TICKET_TTL_MS
+      ) {
+        this.tickets.delete(ticketId);
+        removed = true;
+      }
+    }
+
+    return removed;
   }
 
   private removeExpiredResults(now: number): boolean {
@@ -345,20 +505,32 @@ export class Matchmaker extends DurableObject<Env> {
     return removed;
   }
 
-  private async scheduleResultCleanup(): Promise<void> {
-    let nextExpiry: number | undefined;
-    for (const result of this.results.values()) {
-      if (nextExpiry === undefined || result.expiresAt < nextExpiry) {
-        nextExpiry = result.expiresAt;
+  private async scheduleCleanupAlarm(): Promise<void> {
+    let nextDeadline: number | undefined;
+
+    for (const ticket of this.tickets.values()) {
+      if (ticket.status !== "queued") {
+        continue;
+      }
+
+      const expiresAt = ticket.lastSeenAt + QUEUED_TICKET_TTL_MS;
+      if (nextDeadline === undefined || expiresAt < nextDeadline) {
+        nextDeadline = expiresAt;
       }
     }
 
-    if (nextExpiry === undefined) {
+    for (const result of this.results.values()) {
+      if (nextDeadline === undefined || result.expiresAt < nextDeadline) {
+        nextDeadline = result.expiresAt;
+      }
+    }
+
+    if (nextDeadline === undefined) {
       await this.ctx.storage.deleteAlarm();
       return;
     }
 
-    await this.ctx.storage.setAlarm(nextExpiry);
+    await this.ctx.storage.setAlarm(nextDeadline);
   }
 
   private async saveState(): Promise<void> {
