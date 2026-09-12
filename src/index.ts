@@ -1,4 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
+import {
+  createActiveMatch,
+  listActiveMatchesForPlayer,
+  removeActiveMatch
+} from "./match-store";
 
 export enum GameType {
   Live = 0,
@@ -29,14 +34,6 @@ interface MatchResult {
   websocketUrl: string;
   matchedAt: number;
   expiresAt: number;
-}
-
-interface ActiveMatchRecord {
-  gameId: string;
-  gameType: GameType;
-  playerCount: number;
-  players: string[];
-  matchedAt: number;
 }
 
 interface PlayerMatchSummary {
@@ -71,7 +68,6 @@ type MatchResponse = QueuedResponse | MatchedResponse;
 interface PersistedState {
   tickets: Record<string, Ticket>;
   results: Record<string, MatchResult>;
-  activeMatches?: Record<string, ActiveMatchRecord[]>;
 }
 
 interface LegacyTicket extends MatchRequest {
@@ -112,6 +108,7 @@ interface GameRoomStub {
 export interface Env {
   MATCHMAKER: DurableObjectNamespace<Matchmaker>;
   GAME_ROOM: DurableObjectNamespace;
+  MATCH_DB: D1Database;
   GAME_SERVER_URL: string;
   CORS_ORIGIN?: string;
 }
@@ -127,7 +124,6 @@ const LEGACY_TICKETS_KEY = "tickets";
 export class Matchmaker extends DurableObject<Env> {
   private tickets = new Map<string, Ticket>();
   private results = new Map<string, MatchResult>();
-  private activeMatches = new Map<string, ActiveMatchRecord[]>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -139,7 +135,6 @@ export class Matchmaker extends DurableObject<Env> {
       if (stored) {
         this.tickets = new Map(Object.entries(stored.tickets ?? {}));
         this.results = new Map(Object.entries(stored.results ?? {}));
-        this.activeMatches = new Map(Object.entries(stored.activeMatches ?? {}));
       } else {
         const legacy = await ctx.storage.get<Record<string, LegacyTicket>>(LEGACY_TICKETS_KEY);
         if (legacy) {
@@ -160,16 +155,12 @@ export class Matchmaker extends DurableObject<Env> {
         }
       }
 
-      // State written by the previous matchmaking version does not contain
-      // lastSeenAt. Treat createdAt as the last heartbeat for migration.
       for (const ticket of this.tickets.values()) {
         if (!Number.isFinite(ticket.lastSeenAt)) {
           ticket.lastSeenAt = ticket.createdAt;
           shouldSave = true;
         }
 
-        // A Worker restart can interrupt a match while it is being created.
-        // Put any reserved tickets back into the queue so they do not get stuck.
         if (ticket.status === "matching") {
           ticket.status = "queued";
           shouldSave = true;
@@ -202,8 +193,8 @@ export class Matchmaker extends DurableObject<Env> {
       await this.saveState();
     }
 
-    // Existing games no longer block matchmaking. A player may own many active
-    // Live/Persistent matches, but only one queued matchmaking request at once.
+    // Existing games do not block matchmaking. A player may have many active
+    // Live/Persistent matches, while still having only one queued request.
     const existing = this.findActiveTicketForPlayer(request.playerId);
     if (existing) {
       if (
@@ -297,9 +288,11 @@ export class Matchmaker extends DurableObject<Env> {
       throw new HttpError(400, "playerId is required");
     }
 
-    const tracked = [...(this.activeMatches.get(playerId) ?? [])];
+    const tracked = await listActiveMatchesForPlayer(
+      this.env.MATCH_DB,
+      playerId
+    );
     const matches: PlayerMatchSummary[] = [];
-    let changed = false;
 
     for (const record of tracked) {
       const room = this.env.GAME_ROOM.getByName(record.gameId) as unknown as GameRoomStub;
@@ -310,9 +303,7 @@ export class Matchmaker extends DurableObject<Env> {
         state.status === GAME_STATUS_FINISHED ||
         !state.players.some(player => player.id === playerId)
       ) {
-        if (this.removeActiveMatchFromPlayers(record.gameId, record.players)) {
-          changed = true;
-        }
+        await removeActiveMatch(this.env.MATCH_DB, record.gameId);
         continue;
       }
 
@@ -335,10 +326,6 @@ export class Matchmaker extends DurableObject<Env> {
         ),
         matchedAt: record.matchedAt
       });
-    }
-
-    if (changed) {
-      await this.saveState();
     }
 
     return matches.sort((a, b) => b.matchedAt - a.matchedAt);
@@ -414,17 +401,14 @@ export class Matchmaker extends DurableObject<Env> {
       }
 
       const matchedAt = Date.now();
-      const activeMatch: ActiveMatchRecord = {
+
+      await createActiveMatch(this.env.MATCH_DB, {
         gameId,
         gameType: newTicket.gameType,
         playerCount: newTicket.playerCount,
         players,
         matchedAt
-      };
-
-      for (const playerId of players) {
-        this.addActiveMatch(playerId, activeMatch);
-      }
+      });
 
       for (const ticket of matched) {
         this.tickets.delete(ticket.ticketId);
@@ -443,7 +427,11 @@ export class Matchmaker extends DurableObject<Env> {
       await this.saveState();
       await this.scheduleCleanupAlarm();
     } catch (error) {
-      this.removeActiveMatchFromPlayers(gameId, players);
+      try {
+        await removeActiveMatch(this.env.MATCH_DB, gameId);
+      } catch (databaseCleanupError) {
+        console.error("Failed to clean active match row", databaseCleanupError);
+      }
 
       const retryAt = Date.now();
       for (const ticket of matched) {
@@ -462,48 +450,6 @@ export class Matchmaker extends DurableObject<Env> {
 
       throw error;
     }
-  }
-
-  private addActiveMatch(
-    playerId: string,
-    match: ActiveMatchRecord
-  ): void {
-    const current = this.activeMatches.get(playerId) ?? [];
-    this.activeMatches.set(
-      playerId,
-      [
-        match,
-        ...current.filter(existing => existing.gameId !== match.gameId)
-      ]
-    );
-  }
-
-  private removeActiveMatchFromPlayers(
-    gameId: string,
-    playerIds: string[]
-  ): boolean {
-    let changed = false;
-
-    for (const playerId of playerIds) {
-      const current = this.activeMatches.get(playerId);
-      if (!current) {
-        continue;
-      }
-
-      const updated = current.filter(match => match.gameId !== gameId);
-      if (updated.length === current.length) {
-        continue;
-      }
-
-      changed = true;
-      if (updated.length === 0) {
-        this.activeMatches.delete(playerId);
-      } else {
-        this.activeMatches.set(playerId, updated);
-      }
-    }
-
-    return changed;
   }
 
   private findActiveTicketForPlayer(playerId: string): Ticket | undefined {
@@ -586,8 +532,7 @@ export class Matchmaker extends DurableObject<Env> {
   private async saveState(): Promise<void> {
     const state: PersistedState = {
       tickets: Object.fromEntries(this.tickets),
-      results: Object.fromEntries(this.results),
-      activeMatches: Object.fromEntries(this.activeMatches)
+      results: Object.fromEntries(this.results)
     };
     await this.ctx.storage.put(STATE_KEY, state);
   }
