@@ -7,6 +7,18 @@
     "GAME_SERVER_URL": "https://board-game-server.g-saikirangoud99740.workers.dev",
     "CORS_ORIGIN": "*"
   },
+  "secrets_store_secrets": [
+    {
+      "binding": "CR_TITLEID",
+      "store_id": "60f36e4d45ad4b01b0391aa084f68541",
+      "secret_name": "CR_TITLEID"
+    },
+    {
+      "binding": "CR_PLAYFAB_SECRET",
+      "store_id": "60f36e4d45ad4b01b0391aa084f68541",
+      "secret_name": "CR_PLAYFAB_SECRET"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
