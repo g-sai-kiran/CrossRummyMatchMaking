@@ -10,7 +10,9 @@ The client sends:
 - `gameType` (`0 = Live`, `1 = Persistent`)
 - `playerCount` (`2` to `4`)
 
-Players are matched only with other queued players that requested the **same `gameType` and the same `playerCount`**.
+Before creating or reusing a matchmaking ticket, the service checks the `board-game-server` game registry. If that player already belongs to a game whose status is still `Waiting` or `Playing`, matchmaking does **not** create a new match. Instead it returns the existing `gameId` and a fresh WebSocket URL for that same player so the client can reconnect.
+
+Players who do not already have a running game are matched only with other queued players that requested the **same `gameType` and the same `playerCount`**.
 
 When enough players are available:
 
@@ -35,7 +37,7 @@ Use your deployed matchmaking Worker URL as `MATCHMAKING_URL`, for example:
 https://cross-rummy-matchmaking.<your-workers-subdomain>.workers.dev
 ```
 
-### 1. Join matchmaking
+### 1. Join matchmaking or resume an existing game
 
 ```http
 POST /matchmake
@@ -52,7 +54,21 @@ Body:
 }
 ```
 
-If the player is waiting, the Worker returns HTTP `202`:
+The server first checks whether `player-123` already belongs to a non-finished GameRoom. If so it immediately returns HTTP `200` with that existing match:
+
+```json
+{
+  "ticketId": "new-delivery-id",
+  "status": "matched",
+  "gameId": "existing-game-id",
+  "players": ["player-123", "player-456"],
+  "websocketUrl": "wss://board-game-server.g-saikirangoud99740.workers.dev/ws?gameId=existing-game-id&playerId=player-123"
+}
+```
+
+This reconnect check takes priority over the requested `gameType` and `playerCount`: a player cannot enter matchmaking for another game while their previous game still exists.
+
+If the player has no existing game and is waiting, the Worker returns HTTP `202`:
 
 ```json
 {
@@ -62,7 +78,7 @@ If the player is waiting, the Worker returns HTTP `202`:
 }
 ```
 
-If this request completes a match, the Worker returns HTTP `200`:
+If this request completes a new match, the Worker returns HTTP `200`:
 
 ```json
 {
@@ -74,7 +90,7 @@ If this request completes a match, the Worker returns HTTP `200`:
 }
 ```
 
-Calling `POST /matchmake` again for the same player and the same settings reuses the current ticket instead of creating duplicate queue entries.
+Calling `POST /matchmake` again for the same player and the same settings reuses the current queued ticket instead of creating duplicate queue entries.
 
 If a queued player changes `gameType` or `playerCount`, the old queued ticket is replaced by the new request.
 
@@ -110,9 +126,9 @@ Matched response:
 }
 ```
 
-If the client stops polling for 30 seconds while still queued, the ticket expires. A later status request returns `404` and the client should create a new matchmaking request.
+If the client stops polling for 30 seconds while still queued, the ticket expires. A later status request returns `404` and the client should call `POST /matchmake` again. That new request will first resume any still-running game for the player before creating another matchmaking ticket.
 
-After a match is created, the queue ticket itself is already removed. The status endpoint reads the temporary delivery record, which expires automatically after 10 minutes.
+After a match is created, the queue ticket itself is already removed. The status endpoint reads the temporary delivery record, which expires automatically after 10 minutes. Even after that delivery record expires, calling `POST /matchmake` again can recover the existing game from the backend game registry as long as the GameRoom has not been cleared or finished.
 
 ### 3. Cancel matchmaking
 
@@ -143,210 +159,15 @@ GET /health
 }
 ```
 
-## Unity client example
+## Unity client behavior
 
-This sample uses `UnityWebRequest`, so the matchmaking HTTP calls work in Editor, standalone builds, mobile, and WebGL. After `status == "matched"`, pass the returned `websocketUrl` to your NativeWebSocket connection code.
+The client does not need a separate resume API. On startup, reconnect, or when the player presses Find Match, call the same `POST /matchmake` endpoint with the player's stable `playerId`.
 
-```csharp
-using System;
-using System.Collections;
-using System.Text;
-using UnityEngine;
-using UnityEngine.Networking;
+If the server returns `status = "matched"`, connect directly to the returned `websocketUrl`. This may be either a newly created game or the player's already-running game.
 
-public enum GameType
-{
-    Live = 0,
-    Persistent = 1
-}
+If it returns `status = "queued"`, start polling `/matchmake/status` using `pollAfterMs`.
 
-[Serializable]
-public class MatchmakeRequest
-{
-    public string playerId;
-    public GameType gameType;
-    public int playerCount;
-}
-
-[Serializable]
-public class MatchmakeResponse
-{
-    public string ticketId;
-    public string status;
-    public int pollAfterMs;
-    public string gameId;
-    public string[] players;
-    public string websocketUrl;
-}
-
-public class MatchmakingClient : MonoBehaviour
-{
-    [SerializeField]
-    private string matchmakingUrl =
-        "https://cross-rummy-matchmaking.<your-workers-subdomain>.workers.dev";
-
-    private Coroutine pollingRoutine;
-    private string currentTicketId;
-    private string currentPlayerId;
-
-    public void FindMatch(
-        string playerId,
-        GameType gameType,
-        int playerCount)
-    {
-        CancelLocalPolling();
-        currentPlayerId = playerId;
-        StartCoroutine(CreateTicket(playerId, gameType, playerCount));
-    }
-
-    public void CancelMatchmaking()
-    {
-        if (string.IsNullOrEmpty(currentTicketId))
-        {
-            CancelLocalPolling();
-            return;
-        }
-
-        StartCoroutine(CancelTicket(currentTicketId, currentPlayerId));
-    }
-
-    private IEnumerator CreateTicket(
-        string playerId,
-        GameType gameType,
-        int playerCount)
-    {
-        var payload = new MatchmakeRequest
-        {
-            playerId = playerId,
-            gameType = gameType,
-            playerCount = playerCount
-        };
-
-        string json = JsonUtility.ToJson(payload);
-        using var request = new UnityWebRequest(
-            $"{matchmakingUrl}/matchmake",
-            UnityWebRequest.kHttpVerbPOST);
-
-        request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(json));
-        request.downloadHandler = new DownloadHandlerBuffer();
-        request.SetRequestHeader("Content-Type", "application/json");
-
-        yield return request.SendWebRequest();
-
-        if (request.result != UnityWebRequest.Result.Success)
-        {
-            Debug.LogError($"Matchmaking failed: {request.responseCode} {request.downloadHandler.text}");
-            yield break;
-        }
-
-        var response = JsonUtility.FromJson<MatchmakeResponse>(
-            request.downloadHandler.text);
-
-        currentTicketId = response.ticketId;
-        HandleResponse(response);
-    }
-
-    private void HandleResponse(MatchmakeResponse response)
-    {
-        if (response.status == "matched")
-        {
-            CancelLocalPolling();
-            currentTicketId = null;
-
-            Debug.Log($"Match found: {response.gameId}");
-            Debug.Log($"Connect to: {response.websocketUrl}");
-
-            // Example:
-            // NexusSeven.Interface
-            //     .GetSystem<GameSocketClient>()
-            //     .Connect(response.websocketUrl);
-
-            return;
-        }
-
-        if (response.status == "queued" && pollingRoutine == null)
-        {
-            float pollSeconds = Mathf.Max(0.5f, response.pollAfterMs / 1000f);
-            pollingRoutine = StartCoroutine(PollTicket(pollSeconds));
-        }
-    }
-
-    private IEnumerator PollTicket(float pollSeconds)
-    {
-        while (!string.IsNullOrEmpty(currentTicketId))
-        {
-            yield return new WaitForSecondsRealtime(pollSeconds);
-
-            string url =
-                $"{matchmakingUrl}/matchmake/status?ticketId={UnityWebRequest.EscapeURL(currentTicketId)}";
-
-            using var request = UnityWebRequest.Get(url);
-            yield return request.SendWebRequest();
-
-            if (request.responseCode == 404)
-            {
-                // The queued ticket lease expired. Stop polling and create a
-                // fresh matchmaking request if the user is still searching.
-                currentTicketId = null;
-                pollingRoutine = null;
-                yield break;
-            }
-
-            if (request.result != UnityWebRequest.Result.Success)
-            {
-                Debug.LogWarning($"Match status failed: {request.responseCode} {request.downloadHandler.text}");
-                continue;
-            }
-
-            var response = JsonUtility.FromJson<MatchmakeResponse>(
-                request.downloadHandler.text);
-
-            if (response.status == "matched")
-            {
-                pollingRoutine = null;
-                HandleResponse(response);
-                yield break;
-            }
-
-            if (response.pollAfterMs > 0)
-            {
-                pollSeconds = Mathf.Max(0.5f, response.pollAfterMs / 1000f);
-            }
-        }
-
-        pollingRoutine = null;
-    }
-
-    private IEnumerator CancelTicket(string ticketId, string playerId)
-    {
-        string url =
-            $"{matchmakingUrl}/matchmake" +
-            $"?ticketId={UnityWebRequest.EscapeURL(ticketId)}" +
-            $"&playerId={UnityWebRequest.EscapeURL(playerId)}";
-
-        using var request = UnityWebRequest.Delete(url);
-        yield return request.SendWebRequest();
-
-        if (request.result != UnityWebRequest.Result.Success &&
-            request.responseCode != 404)
-        {
-            Debug.LogWarning($"Cancel matchmaking failed: {request.responseCode} {request.downloadHandler.text}");
-        }
-
-        currentTicketId = null;
-        CancelLocalPolling();
-    }
-
-    private void CancelLocalPolling()
-    {
-        if (pollingRoutine != null)
-        {
-            StopCoroutine(pollingRoutine);
-            pollingRoutine = null;
-        }
-    }
-}
-```
+If a queued poll later returns `404`, the lease expired. If the user is still searching, call `POST /matchmake` again rather than assuming there is no active game; the POST performs the authoritative running-game lookup first.
 
 ### NativeWebSocket handoff
 
@@ -386,9 +207,11 @@ curl -X POST http://localhost:8787/matchmake \
 
 The second request should return `matched`. Poll player 1's ticket and it should return the same `gameId`.
 
+Then disconnect `p1` from the game but leave the GameRoom alive. Call `POST /matchmake` for `p1` again. It should return HTTP `200` with the **same existing `gameId`**, not queue the player for another match.
+
 To test abandoned-ticket cleanup, queue a player and then stop polling. After more than 30 seconds, `GET /matchmake/status?ticketId=...` should return `404`.
 
-A request with `gameType: 1` or a different `playerCount` must not join that match.
+A request with `gameType: 1` or a different `playerCount` must not join an unrelated queued match.
 
 > Local cross-Worker Durable Object RPC requires the `board-game-server` Worker to be available/configured. For the simplest end-to-end check, deploy both Workers and test their `workers.dev` URLs.
 
@@ -398,6 +221,7 @@ The game server must be deployed with:
 
 - Worker name: `board-game-server`
 - exported Durable Object class: `GameRoom`
+- its game registry methods (`listRegisteredGameIds`, `getGameState`, `unregisterGameId`)
 - public WebSocket route: `/ws?gameId=...&playerId=...`
 
 This repository already binds to it using:
@@ -429,5 +253,6 @@ After deploy, set the Unity `matchmakingUrl` field to the deployed `cross-rummy-
 ## Production notes
 
 - `CORS_ORIGIN` is currently `*` so the Unity WebGL client can call matchmaking during development. Before production, set it to the actual game/site origin if possible.
-- `playerId` is currently trusted from the client. Add your PlayFab/auth token validation before launch so one user cannot queue or cancel as another player.
+- `playerId` is currently trusted from the client. Add your PlayFab/auth token validation before launch so one user cannot resume, queue, or cancel as another player.
+- The current reconnect lookup scans registered games. That is fine for the present scale, but if active concurrent games grow significantly, replace it with a dedicated `playerId -> gameId` index in a registry Durable Object so reconnect lookup stays O(1).
 - The current matchmaker uses one global Durable Object, which is a good simple starting point. If concurrency becomes very large, shard queues by `(gameType, playerCount, region)` while keeping the same public API.
