@@ -31,6 +31,27 @@ interface MatchResult {
   expiresAt: number;
 }
 
+interface ActiveMatchRecord {
+  gameId: string;
+  gameType: GameType;
+  playerCount: number;
+  players: string[];
+  matchedAt: number;
+}
+
+interface PlayerMatchSummary {
+  gameId: string;
+  gameType: GameType;
+  status: number;
+  playerCount: number;
+  players: GamePlayerSummary[];
+  currentTurnSeat: number | null;
+  turnEndsAt: number | null;
+  isYourTurn: boolean;
+  websocketUrl: string;
+  matchedAt: number;
+}
+
 interface QueuedResponse {
   ticketId: string;
   status: "queued";
@@ -50,6 +71,7 @@ type MatchResponse = QueuedResponse | MatchedResponse;
 interface PersistedState {
   tickets: Record<string, Ticket>;
   results: Record<string, MatchResult>;
+  activeMatches?: Record<string, ActiveMatchRecord[]>;
 }
 
 interface LegacyTicket extends MatchRequest {
@@ -61,6 +83,8 @@ interface LegacyTicket extends MatchRequest {
 
 interface GamePlayerSummary {
   id: string;
+  seat?: number;
+  score?: number;
 }
 
 interface GameStateSummary {
@@ -69,6 +93,8 @@ interface GameStateSummary {
   gameType: GameType;
   playerCount: number;
   players: GamePlayerSummary[];
+  currentTurnSeat: number | null;
+  turnEndsAt: number | null;
 }
 
 interface GameRoomStub {
@@ -81,8 +107,6 @@ interface GameRoomStub {
   addPlayer(playerId: string): Promise<unknown>;
   getGameState(): Promise<GameStateSummary | null>;
   clearGame(): Promise<void>;
-  listRegisteredGameIds(): Promise<string[]>;
-  unregisterGameId(gameId: string): Promise<void>;
 }
 
 export interface Env {
@@ -93,7 +117,6 @@ export interface Env {
 }
 
 const MATCHMAKER_NAME = "global";
-const GAME_REGISTRY_NAME = "__game_registry__";
 const GAME_STATUS_FINISHED = 2;
 const POLL_AFTER_MS = 1_000;
 const QUEUED_TICKET_TTL_MS = 30_000;
@@ -104,6 +127,7 @@ const LEGACY_TICKETS_KEY = "tickets";
 export class Matchmaker extends DurableObject<Env> {
   private tickets = new Map<string, Ticket>();
   private results = new Map<string, MatchResult>();
+  private activeMatches = new Map<string, ActiveMatchRecord[]>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -115,6 +139,7 @@ export class Matchmaker extends DurableObject<Env> {
       if (stored) {
         this.tickets = new Map(Object.entries(stored.tickets ?? {}));
         this.results = new Map(Object.entries(stored.results ?? {}));
+        this.activeMatches = new Map(Object.entries(stored.activeMatches ?? {}));
       } else {
         const legacy = await ctx.storage.get<Record<string, LegacyTicket>>(LEGACY_TICKETS_KEY);
         if (legacy) {
@@ -177,14 +202,8 @@ export class Matchmaker extends DurableObject<Env> {
       await this.saveState();
     }
 
-    // Reconnect takes priority over creating a new matchmaking ticket. If this
-    // player still belongs to a Waiting/Playing GameRoom, return that room so a
-    // refresh, app restart, or temporary disconnect never creates a second game.
-    const runningGame = await this.findRunningGameForPlayer(request.playerId);
-    if (runningGame) {
-      return await this.resumeRunningGame(request.playerId, runningGame);
-    }
-
+    // Existing games no longer block matchmaking. A player may own many active
+    // Live/Persistent matches, but only one queued matchmaking request at once.
     const existing = this.findActiveTicketForPlayer(request.playerId);
     if (existing) {
       if (
@@ -206,7 +225,6 @@ export class Matchmaker extends DurableObject<Env> {
       }
 
       if (existing.status === "matching") {
-        // The player is already reserved for a game creation in progress.
         return this.toQueuedResponse(existing);
       }
 
@@ -259,8 +277,6 @@ export class Matchmaker extends DurableObject<Env> {
       return null;
     }
 
-    // Polling is the queued-ticket heartbeat. If the app/browser disappears,
-    // polling stops and the ticket expires automatically after 30 seconds.
     ticket.lastSeenAt = now;
     await this.saveState();
     await this.scheduleCleanupAlarm();
@@ -274,6 +290,58 @@ export class Matchmaker extends DurableObject<Env> {
     }
 
     return this.toQueuedResponse(ticket);
+  }
+
+  async getPlayerMatches(playerId: string): Promise<PlayerMatchSummary[]> {
+    if (!playerId.trim()) {
+      throw new HttpError(400, "playerId is required");
+    }
+
+    const tracked = [...(this.activeMatches.get(playerId) ?? [])];
+    const matches: PlayerMatchSummary[] = [];
+    let changed = false;
+
+    for (const record of tracked) {
+      const room = this.env.GAME_ROOM.getByName(record.gameId) as unknown as GameRoomStub;
+      const state = await room.getGameState();
+
+      if (
+        !state ||
+        state.status === GAME_STATUS_FINISHED ||
+        !state.players.some(player => player.id === playerId)
+      ) {
+        if (this.removeActiveMatchFromPlayers(record.gameId, record.players)) {
+          changed = true;
+        }
+        continue;
+      }
+
+      const localPlayer = state.players.find(player => player.id === playerId);
+      matches.push({
+        gameId: state.gameId,
+        gameType: state.gameType,
+        status: state.status,
+        playerCount: state.playerCount,
+        players: state.players,
+        currentTurnSeat: state.currentTurnSeat,
+        turnEndsAt: state.turnEndsAt,
+        isYourTurn:
+          localPlayer?.seat !== undefined &&
+          localPlayer.seat === state.currentTurnSeat,
+        websocketUrl: buildGameWebSocketUrl(
+          this.env.GAME_SERVER_URL,
+          state.gameId,
+          playerId
+        ),
+        matchedAt: record.matchedAt
+      });
+    }
+
+    if (changed) {
+      await this.saveState();
+    }
+
+    return matches.sort((a, b) => b.matchedAt - a.matchedAt);
   }
 
   async cancel(ticketId: string, playerId: string): Promise<"cancelled" | "matched" | "not-found"> {
@@ -339,8 +407,6 @@ export class Matchmaker extends DurableObject<Env> {
     const room = this.env.GAME_ROOM.getByName(gameId) as unknown as GameRoomStub;
 
     try {
-      // getByName(gameId) addresses the GameRoom Durable Object. The first RPC
-      // below causes that object to be created/lazily instantiated by Cloudflare.
       await room.createGame(gameId, players[0], newTicket.playerCount, newTicket.gameType);
 
       for (const playerId of players.slice(1)) {
@@ -348,6 +414,18 @@ export class Matchmaker extends DurableObject<Env> {
       }
 
       const matchedAt = Date.now();
+      const activeMatch: ActiveMatchRecord = {
+        gameId,
+        gameType: newTicket.gameType,
+        playerCount: newTicket.playerCount,
+        players,
+        matchedAt
+      };
+
+      for (const playerId of players) {
+        this.addActiveMatch(playerId, activeMatch);
+      }
+
       for (const ticket of matched) {
         this.tickets.delete(ticket.ticketId);
         this.results.set(ticket.ticketId, {
@@ -362,11 +440,11 @@ export class Matchmaker extends DurableObject<Env> {
         });
       }
 
-      // The queue tickets are now gone. Only short-lived delivery records remain,
-      // so clients that were waiting can poll once more and receive the game info.
       await this.saveState();
       await this.scheduleCleanupAlarm();
     } catch (error) {
+      this.removeActiveMatchFromPlayers(gameId, players);
+
       const retryAt = Date.now();
       for (const ticket of matched) {
         ticket.status = "queued";
@@ -386,74 +464,46 @@ export class Matchmaker extends DurableObject<Env> {
     }
   }
 
-  private async findRunningGameForPlayer(playerId: string): Promise<GameStateSummary | null> {
-    const registry = this.env.GAME_ROOM.getByName(GAME_REGISTRY_NAME) as unknown as GameRoomStub;
-    const gameIds = await registry.listRegisteredGameIds();
-
-    for (const gameId of gameIds) {
-      const room = this.env.GAME_ROOM.getByName(gameId) as unknown as GameRoomStub;
-      const state = await room.getGameState();
-
-      if (!state) {
-        await registry.unregisterGameId(gameId);
-        continue;
-      }
-
-      if (state.status === GAME_STATUS_FINISHED) {
-        continue;
-      }
-
-      if (state.players.some(player => player.id === playerId)) {
-        return state;
-      }
-    }
-
-    return null;
+  private addActiveMatch(
+    playerId: string,
+    match: ActiveMatchRecord
+  ): void {
+    const current = this.activeMatches.get(playerId) ?? [];
+    this.activeMatches.set(
+      playerId,
+      [
+        match,
+        ...current.filter(existing => existing.gameId !== match.gameId)
+      ]
+    );
   }
 
-  private async resumeRunningGame(
-    playerId: string,
-    state: GameStateSummary
-  ): Promise<MatchedResponse> {
-    // A player who already has a game must not stay in the queue as well.
-    for (const [ticketId, ticket] of this.tickets) {
-      if (ticket.playerId === playerId && ticket.status === "queued") {
-        this.tickets.delete(ticketId);
+  private removeActiveMatchFromPlayers(
+    gameId: string,
+    playerIds: string[]
+  ): boolean {
+    let changed = false;
+
+    for (const playerId of playerIds) {
+      const current = this.activeMatches.get(playerId);
+      if (!current) {
+        continue;
+      }
+
+      const updated = current.filter(match => match.gameId !== gameId);
+      if (updated.length === current.length) {
+        continue;
+      }
+
+      changed = true;
+      if (updated.length === 0) {
+        this.activeMatches.delete(playerId);
+      } else {
+        this.activeMatches.set(playerId, updated);
       }
     }
 
-    // Keep only the newest delivery record for this player. Delivery records
-    // are short-lived and exist only so the normal matched response contract
-    // stays identical when reconnecting.
-    for (const [ticketId, result] of this.results) {
-      if (result.playerId === playerId) {
-        this.results.delete(ticketId);
-      }
-    }
-
-    const now = Date.now();
-    const ticketId = crypto.randomUUID();
-    const players = state.players.map(player => player.id);
-    const result: MatchResult = {
-      ticketId,
-      playerId,
-      status: "matched",
-      gameId: state.gameId,
-      players,
-      websocketUrl: buildGameWebSocketUrl(
-        this.env.GAME_SERVER_URL,
-        state.gameId,
-        playerId
-      ),
-      matchedAt: now,
-      expiresAt: now + MATCH_RESULT_TTL_MS
-    };
-
-    this.results.set(ticketId, result);
-    await this.saveState();
-    await this.scheduleCleanupAlarm();
-
-    return this.toMatchedResponse(result);
+    return changed;
   }
 
   private findActiveTicketForPlayer(playerId: string): Ticket | undefined {
@@ -536,7 +586,8 @@ export class Matchmaker extends DurableObject<Env> {
   private async saveState(): Promise<void> {
     const state: PersistedState = {
       tickets: Object.fromEntries(this.tickets),
-      results: Object.fromEntries(this.results)
+      results: Object.fromEntries(this.results),
+      activeMatches: Object.fromEntries(this.activeMatches)
     };
     await this.ctx.storage.put(STATE_KEY, state);
   }
@@ -630,6 +681,20 @@ export default {
 
         const result = await matchmaker.getStatus(ticketId);
         return result ? json(result, env) : json({ error: "Ticket not found or expired" }, env, 404);
+      }
+
+      if (request.method === "GET" && url.pathname === "/matches") {
+        const playerId = url.searchParams.get("playerId")?.trim();
+        if (!playerId) {
+          throw new HttpError(400, "playerId is required");
+        }
+
+        const matches = await matchmaker.getPlayerMatches(playerId);
+        return json({
+          playerId,
+          matches,
+          count: matches.length
+        }, env);
       }
 
       if (request.method === "DELETE" && url.pathname === "/matchmake") {
