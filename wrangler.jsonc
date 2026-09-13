@@ -7,6 +7,13 @@
     "GAME_SERVER_URL": "https://board-game-server.g-saikirangoud99740.workers.dev",
     "CORS_ORIGIN": "*"
   },
+  "d1_databases": [
+    {
+      "binding": "MATCH_DB",
+      "database_name": "cross-rummy-matches",
+      "database_id": "f8c688bf-703c-4b98-a79a-6c065133b430"
+    }
+  ],
   "secrets_store_secrets": [
     {
       "binding": "CR_TITLEID",
