@@ -111,6 +111,135 @@ Matchmaking creates the initial rows. The game server updates turn and score inf
 
 The GameRoom Durable Object is still the source of truth. D1 is the searchable summary used by menus and reconnect UI.
 
+### Active-match example
+
+```text
+active_matches
+------------------------------------------------------------
+game-123 | gameType 1 | Playing | players 2 | turn seat 1
+```
+
+```text
+active_match_players
+------------------------------------------------------------
+game-123 | PLAYFAB_A | seat 0 | score 35
+game-123 | PLAYFAB_B | seat 1 | score 48
+```
+
+For `PLAYFAB_A`, `/matches` can return:
+
+```json
+{
+  "gameId": "game-123",
+  "gameType": 1,
+  "status": 1,
+  "playerCount": 2,
+  "currentTurnSeat": 1,
+  "isYourTurn": false,
+  "players": [
+    { "id": "PLAYFAB_A", "seat": 0, "score": 35 },
+    { "id": "PLAYFAB_B", "seat": 1, "score": 48 }
+  ]
+}
+```
+
+## Rank ownership
+
+Matchmaking does not calculate rank.
+
+When the GameRoom finishes, `CrossRummyBackend` updates PlayFab using these rules:
+
+```text
+Unique winner: RankRating +30, Wins +1, MatchesPlayed +1
+Loser:        RankRating -30, Losses +1, MatchesPlayed +1
+Draw:         RankRating unchanged, MatchesPlayed +1
+```
+
+Example:
+
+```text
+Final score
+PLAYFAB_A = 84
+PLAYFAB_B = 61
+
+Result
+PLAYFAB_A -> +30 rating, +1 win, +1 match
+PLAYFAB_B -> -30 rating, +1 loss, +1 match
+```
+
+See the `CrossRummyBackend` README for the full 2-player, 4-player, and draw examples.
+
+## Match history
+
+Important distinction:
+
+```text
+active_matches = games still in progress
+match history  = completed games
+```
+
+Completed match history is **not implemented yet**.
+
+Currently, when a match finishes, the game server removes its rows from `active_matches` and `active_match_players`. Therefore `/matches` is an active-games API, not a completed-history API.
+
+Recommended future D1 schema:
+
+```text
+match_history
+------------------------------------------------------------
+game_id
+game_type
+started_at
+finished_at
+winner_player_id
+is_draw
+player_count
+
+match_history_players
+------------------------------------------------------------
+game_id
+player_id
+seat
+final_score
+result
+rank_delta
+```
+
+Example completed match:
+
+```json
+{
+  "gameId": "game-123",
+  "gameType": 0,
+  "winnerPlayerId": "PLAYFAB_A",
+  "isDraw": false,
+  "players": [
+    {
+      "playerId": "PLAYFAB_A",
+      "seat": 0,
+      "finalScore": 84,
+      "result": "win",
+      "rankDelta": 30
+    },
+    {
+      "playerId": "PLAYFAB_B",
+      "seat": 1,
+      "finalScore": 61,
+      "result": "loss",
+      "rankDelta": -30
+    }
+  ]
+}
+```
+
+A future API could be:
+
+```http
+GET /match-history?playerId=<PLAYFAB_ID>
+```
+
+That should query permanent history tables, not the active-match tables.
+
 ## API
 
 ### Start or join matchmaking
@@ -159,7 +288,7 @@ DELETE /matchmake?ticketId=<ticketId>&playerId=<playerId>
 GET /matches?playerId=<PLAYFAB_ID>
 ```
 
-This now reads from D1 instead of querying every GameRoom.
+This reads from D1 instead of querying every GameRoom.
 
 Example fields returned per match:
 
