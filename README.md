@@ -2,257 +2,380 @@
 
 Cloudflare Worker + Durable Object matchmaking service for Cross Rummy.
 
-## What it does
+## Responsibility
 
-The client sends:
+This repo owns:
 
-- `playerId`
-- `gameType` (`0 = Live`, `1 = Persistent`)
-- `playerCount` (`2` to `4`)
+- matchmaking queue
+- matching players by `gameType` and `playerCount`
+- creating GameRoom Durable Objects in `board-game-server`
+- storing active-match indexes in D1
+- serving the `GET /matches?playerId=...` API
 
-Before creating or reusing a matchmaking ticket, the service checks the `board-game-server` game registry. If that player already belongs to a game whose status is still `Waiting` or `Playing`, matchmaking does **not** create a new match. Instead it returns the existing `gameId` and a fresh WebSocket URL for that same player so the client can reconnect.
+This repo does **not** own gameplay rules, scoring, turn progression, match completion, or PlayFab rank updates. Those belong to `CrossRummyBackend`.
 
-Players who do not already have a running game are matched only with other queued players that requested the **same `gameType` and the same `playerCount`**.
-
-When enough players are available:
-
-1. The matchmaker reserves those tickets so another request cannot reuse them.
-2. It generates a new `gameId`.
-3. It addresses `GAME_ROOM.getByName(gameId)` in the `board-game-server` Worker.
-4. The first RPC to `createGame(...)` causes Cloudflare to create/lazily instantiate that `GameRoom` Durable Object.
-5. The remaining matched players are added to the room.
-6. The matchmaking queue tickets are deleted.
-7. A short-lived match-result record is kept for 10 minutes so every waiting client can poll and receive the same `gameId` and its own WebSocket URL.
-8. The client connects directly to `board-game-server` using the returned `websocketUrl`.
-
-Queued tickets use a **30-second lease**. Calling the status endpoint refreshes the lease. If a player closes the app, loses connection, or otherwise stops polling, the ticket expires automatically and is removed from matchmaking, so an abandoned player cannot be matched later.
-
-The `board-game-server` binding is configured as a cross-Worker Durable Object binding in `wrangler.jsonc`.
-
-## API
-
-Use your deployed matchmaking Worker URL as `MATCHMAKING_URL`, for example:
+## Architecture
 
 ```text
-https://cross-rummy-matchmaking.<your-workers-subdomain>.workers.dev
+Unity
+  |
+  | POST /matchmake
+  v
+CrossRummyMatchMaking
+  |
+  | remote Durable Object RPC
+  v
+board-game-server / GameRoom
+  |
+  +--> authoritative gameplay state
+  +--> updates D1 turn + score snapshots
+  +--> removes D1 row when game finishes
+  +--> updates PlayFab rank/results
+
+Unity
+  |
+  | GET /matches?playerId=...
+  v
+CrossRummyMatchMaking
+  |
+  v
+D1 active-match snapshot
 ```
 
-### 1. Join matchmaking or resume an existing game
+## Matchmaking flow
 
-```http
-POST /matchmake
-Content-Type: application/json
-```
-
-Body:
+Client request:
 
 ```json
 {
-  "playerId": "player-123",
+  "playerId": "PLAYFAB_ID",
   "gameType": 0,
   "playerCount": 2
 }
 ```
 
-The server first checks whether `player-123` already belongs to a non-finished GameRoom. If so it immediately returns HTTP `200` with that existing match:
+- `gameType = 0` -> Live
+- `gameType = 1` -> Persistent
+- `playerCount = 2..4`
+
+Players are matched only when `gameType` and `playerCount` are the same.
+
+A player may have multiple active games, but only one active matchmaking ticket at a time.
+
+Queued tickets expire after 30 seconds unless the client keeps polling.
+
+When enough players are available:
+
+1. Tickets are reserved.
+2. A new `gameId` is created.
+3. Matchmaking calls `GameRoom.createGame(...)`.
+4. Remaining players are added using `GameRoom.addPlayer(...)`.
+5. Initial match/player rows are inserted into D1.
+6. Matchmaking calls `GameRoom.syncMatchSnapshot()` so D1 immediately gets the authoritative first turn and scores.
+7. Queue tickets are removed.
+8. A temporary matched result is kept for 10 minutes for polling clients.
+
+If creation fails, the partial D1 row and GameRoom are cleaned up and players are returned to the queue.
+
+## D1 active-match data
+
+Database:
+
+```text
+cross-rummy-matches
+```
+
+### active_matches
+
+```text
+game_id
+game_type
+status
+player_count
+current_turn_seat
+turn_ends_at
+matched_at
+updated_at
+```
+
+### active_match_players
+
+```text
+game_id
+player_id
+seat
+score
+```
+
+Matchmaking creates the initial rows. The game server updates turn and score information while the match is running.
+
+The GameRoom Durable Object is still the source of truth. D1 is the searchable summary used by menus and reconnect UI.
+
+### Active-match example
+
+```text
+active_matches
+------------------------------------------------------------
+game-123 | gameType 1 | Playing | players 2 | turn seat 1
+```
+
+```text
+active_match_players
+------------------------------------------------------------
+game-123 | PLAYFAB_A | seat 0 | score 35
+game-123 | PLAYFAB_B | seat 1 | score 48
+```
+
+For `PLAYFAB_A`, `/matches` can return:
 
 ```json
 {
-  "ticketId": "new-delivery-id",
-  "status": "matched",
-  "gameId": "existing-game-id",
-  "players": ["player-123", "player-456"],
-  "websocketUrl": "wss://board-game-server.g-saikirangoud99740.workers.dev/ws?gameId=existing-game-id&playerId=player-123"
+  "gameId": "game-123",
+  "gameType": 1,
+  "status": 1,
+  "playerCount": 2,
+  "currentTurnSeat": 1,
+  "isYourTurn": false,
+  "players": [
+    { "id": "PLAYFAB_A", "seat": 0, "score": 35 },
+    { "id": "PLAYFAB_B", "seat": 1, "score": 48 }
+  ]
 }
 ```
 
-This reconnect check takes priority over the requested `gameType` and `playerCount`: a player cannot enter matchmaking for another game while their previous game still exists.
+## Rank ownership
 
-If the player has no existing game and is waiting, the Worker returns HTTP `202`:
+Matchmaking does not calculate rank.
+
+When the GameRoom finishes, `CrossRummyBackend` updates PlayFab using these rules:
+
+```text
+Unique winner: RankRating +30, Wins +1, MatchesPlayed +1
+Loser:        RankRating -30, Losses +1, MatchesPlayed +1
+Draw:         RankRating unchanged, MatchesPlayed +1
+```
+
+Example:
+
+```text
+Final score
+PLAYFAB_A = 84
+PLAYFAB_B = 61
+
+Result
+PLAYFAB_A -> +30 rating, +1 win, +1 match
+PLAYFAB_B -> -30 rating, +1 loss, +1 match
+```
+
+See the `CrossRummyBackend` README for the full 2-player, 4-player, and draw examples.
+
+## Match history
+
+Important distinction:
+
+```text
+active_matches = games still in progress
+match history  = completed games
+```
+
+Completed match history is **not implemented yet**.
+
+Currently, when a match finishes, the game server removes its rows from `active_matches` and `active_match_players`. Therefore `/matches` is an active-games API, not a completed-history API.
+
+Recommended future D1 schema:
+
+```text
+match_history
+------------------------------------------------------------
+game_id
+game_type
+started_at
+finished_at
+winner_player_id
+is_draw
+player_count
+
+match_history_players
+------------------------------------------------------------
+game_id
+player_id
+seat
+final_score
+result
+rank_delta
+```
+
+Example completed match:
 
 ```json
 {
-  "ticketId": "8c7b...",
+  "gameId": "game-123",
+  "gameType": 0,
+  "winnerPlayerId": "PLAYFAB_A",
+  "isDraw": false,
+  "players": [
+    {
+      "playerId": "PLAYFAB_A",
+      "seat": 0,
+      "finalScore": 84,
+      "result": "win",
+      "rankDelta": 30
+    },
+    {
+      "playerId": "PLAYFAB_B",
+      "seat": 1,
+      "finalScore": 61,
+      "result": "loss",
+      "rankDelta": -30
+    }
+  ]
+}
+```
+
+A future API could be:
+
+```http
+GET /match-history?playerId=<PLAYFAB_ID>
+```
+
+That should query permanent history tables, not the active-match tables.
+
+## API
+
+### Start or join matchmaking
+
+```http
+POST /matchmake
+```
+
+Queued:
+
+```json
+{
+  "ticketId": "ticket-id",
   "status": "queued",
   "pollAfterMs": 1000
 }
 ```
 
-If this request completes a new match, the Worker returns HTTP `200`:
+Matched:
 
 ```json
 {
-  "ticketId": "8c7b...",
+  "ticketId": "ticket-id",
   "status": "matched",
-  "gameId": "1d21...",
-  "players": ["player-123", "player-456"],
-  "websocketUrl": "wss://board-game-server.g-saikirangoud99740.workers.dev/ws?gameId=1d21...&playerId=player-123"
+  "gameId": "game-id",
+  "players": ["player-a", "player-b"],
+  "websocketUrl": "wss://board-game-server.../ws?gameId=game-id&playerId=player-a"
 }
 ```
 
-Calling `POST /matchmake` again for the same player and the same settings reuses the current queued ticket instead of creating duplicate queue entries.
-
-If a queued player changes `gameType` or `playerCount`, the old queued ticket is replaced by the new request.
-
-### 2. Poll ticket status
-
-A queued client should poll using the `pollAfterMs` value returned by the server.
+### Poll queued ticket
 
 ```http
 GET /matchmake/status?ticketId=<ticketId>
 ```
 
-Each successful queued status poll refreshes the ticket's 30-second lease.
-
-Queued response:
-
-```json
-{
-  "ticketId": "8c7b...",
-  "status": "queued",
-  "pollAfterMs": 1000
-}
-```
-
-Matched response:
-
-```json
-{
-  "ticketId": "8c7b...",
-  "status": "matched",
-  "gameId": "1d21...",
-  "players": ["player-123", "player-456"],
-  "websocketUrl": "wss://board-game-server.g-saikirangoud99740.workers.dev/ws?gameId=1d21...&playerId=player-123"
-}
-```
-
-If the client stops polling for 30 seconds while still queued, the ticket expires. A later status request returns `404` and the client should call `POST /matchmake` again. That new request will first resume any still-running game for the player before creating another matchmaking ticket.
-
-After a match is created, the queue ticket itself is already removed. The status endpoint reads the temporary delivery record, which expires automatically after 10 minutes. Even after that delivery record expires, calling `POST /matchmake` again can recover the existing game from the backend game registry as long as the GameRoom has not been cleared or finished.
-
-### 3. Cancel matchmaking
+### Cancel queued ticket
 
 ```http
 DELETE /matchmake?ticketId=<ticketId>&playerId=<playerId>
 ```
 
-Success:
+### Get player's active matches
 
-```json
-{
-  "ticketId": "8c7b...",
-  "status": "cancelled"
-}
+```http
+GET /matches?playerId=<PLAYFAB_ID>
 ```
 
-A ticket that is already being converted into a game cannot be cancelled and returns HTTP `409`.
+This reads from D1 instead of querying every GameRoom.
 
-### 4. Health check
+Example fields returned per match:
+
+```text
+gameId
+gameType
+status
+playerCount
+players[id, seat, score]
+currentTurnSeat
+turnEndsAt
+isYourTurn
+matchedAt
+updatedAt
+websocketUrl
+```
+
+### Health
 
 ```http
 GET /health
 ```
 
-```json
-{
-  "status": "ok"
-}
+## Cloudflare bindings
+
+```text
+MATCHMAKER -> local Matchmaker Durable Object
+GAME_ROOM  -> remote GameRoom Durable Object in board-game-server
+MATCH_DB   -> D1 database cross-rummy-matches
 ```
 
-## Unity client behavior
+## Migrations
 
-The client does not need a separate resume API. On startup, reconnect, or when the player presses Find Match, call the same `POST /matchmake` endpoint with the player's stable `playerId`.
+Current migrations:
 
-If the server returns `status = "matched"`, connect directly to the returned `websocketUrl`. This may be either a newly created game or the player's already-running game.
-
-If it returns `status = "queued"`, start polling `/matchmake/status` using `pollAfterMs`.
-
-If a queued poll later returns `404`, the lease expired. If the user is still searching, call `POST /matchmake` again rather than assuming there is no active game; the POST performs the authoritative running-game lookup first.
-
-### NativeWebSocket handoff
-
-Do not rebuild the game URL on the client. Use the `websocketUrl` returned by matchmaking:
-
-```csharp
-var websocket = new NativeWebSocket.WebSocket(matchResponse.websocketUrl);
-await websocket.Connect();
+```text
+0001_active_matches.sql
+0002_match_snapshots.sql
 ```
 
-That URL already contains the `gameId` and the correct `playerId`.
-
-## Quick manual test
-
-Start the Worker locally:
+Apply migrations before deploying code that expects the new columns:
 
 ```bash
-npm install
-npm run dev
+npx wrangler d1 migrations apply cross-rummy-matches --remote
 ```
 
-Queue player 1:
+If migration `0002` is missing, match creation can fail when inserting the D1 row and players will be requeued.
 
-```bash
-curl -X POST http://localhost:8787/matchmake \
-  -H "Content-Type: application/json" \
-  -d '{"playerId":"p1","gameType":0,"playerCount":2}'
+## Deploy order
+
+When GameRoom RPCs or D1 schema changes:
+
+```text
+1. Apply D1 migrations
+2. Deploy CrossRummyBackend / board-game-server
+3. Deploy CrossRummyMatchMaking
 ```
 
-Queue player 2 with the same mode/count:
-
-```bash
-curl -X POST http://localhost:8787/matchmake \
-  -H "Content-Type: application/json" \
-  -d '{"playerId":"p2","gameType":0,"playerCount":2}'
-```
-
-The second request should return `matched`. Poll player 1's ticket and it should return the same `gameId`.
-
-Then disconnect `p1` from the game but leave the GameRoom alive. Call `POST /matchmake` for `p1` again. It should return HTTP `200` with the **same existing `gameId`**, not queue the player for another match.
-
-To test abandoned-ticket cleanup, queue a player and then stop polling. After more than 30 seconds, `GET /matchmake/status?ticketId=...` should return `404`.
-
-A request with `gameType: 1` or a different `playerCount` must not join an unrelated queued match.
-
-> Local cross-Worker Durable Object RPC requires the `board-game-server` Worker to be available/configured. For the simplest end-to-end check, deploy both Workers and test their `workers.dev` URLs.
-
-## Deploy
-
-The game server must be deployed with:
-
-- Worker name: `board-game-server`
-- exported Durable Object class: `GameRoom`
-- its game registry methods (`listRegisteredGameIds`, `getGameState`, `unregisterGameId`)
-- public WebSocket route: `/ws?gameId=...&playerId=...`
-
-This repository already binds to it using:
-
-```jsonc
-{
-  "name": "GAME_ROOM",
-  "class_name": "GameRoom",
-  "script_name": "board-game-server"
-}
-```
-
-The public game server URL is configured in `wrangler.jsonc`:
-
-```jsonc
-"GAME_SERVER_URL": "https://board-game-server.g-saikirangoud99740.workers.dev"
-```
-
-Then run:
+Then deploy matchmaking:
 
 ```bash
 npm install
 npm run typecheck
-npm run deploy
+npx wrangler deploy
 ```
 
-After deploy, set the Unity `matchmakingUrl` field to the deployed `cross-rummy-matchmaking` Worker URL.
+## Unity flow
 
-## Production notes
+```text
+PlayFab login
+  -> PlayFabId
+  -> POST /matchmake
+  -> queued: poll status
+  -> matched: connect using returned websocketUrl
+```
 
-- `CORS_ORIGIN` is currently `*` so the Unity WebGL client can call matchmaking during development. Before production, set it to the actual game/site origin if possible.
-- `playerId` is currently trusted from the client. Add your PlayFab/auth token validation before launch so one user cannot resume, queue, or cancel as another player.
-- The current reconnect lookup scans registered games. That is fine for the present scale, but if active concurrent games grow significantly, replace it with a dedicated `playerId -> gameId` index in a registry Durable Object so reconnect lookup stays O(1).
-- The current matchmaker uses one global Durable Object, which is a good simple starting point. If concurrency becomes very large, shard queues by `(gameType, playerCount, region)` while keeping the same public API.
+For My Matches:
+
+```text
+GET /matches?playerId=<PlayFabId>
+```
+
+Use the returned `websocketUrl` directly in Unity.
+
+## Scaling notes
+
+- D1 handles the active-match index and removes the need to scan every GameRoom.
+- The queue itself still uses one global Matchmaker Durable Object.
+- If queue traffic becomes large, shard matchmaking by game type, player count, region, or rank bucket.
+- Player identity should eventually be validated server-side instead of trusting the client-supplied ID.
