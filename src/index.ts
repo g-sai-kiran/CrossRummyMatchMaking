@@ -36,6 +36,12 @@ interface MatchResult {
   expiresAt: number;
 }
 
+interface GamePlayerSummary {
+  id: string;
+  seat: number;
+  score: number;
+}
+
 interface PlayerMatchSummary {
   gameId: string;
   gameType: GameType;
@@ -47,6 +53,7 @@ interface PlayerMatchSummary {
   isYourTurn: boolean;
   websocketUrl: string;
   matchedAt: number;
+  updatedAt: number;
 }
 
 interface QueuedResponse {
@@ -77,22 +84,6 @@ interface LegacyTicket extends MatchRequest {
   status: "queued" | "matching" | "matched" | "cancelled";
 }
 
-interface GamePlayerSummary {
-  id: string;
-  seat?: number;
-  score?: number;
-}
-
-interface GameStateSummary {
-  gameId: string;
-  status: number;
-  gameType: GameType;
-  playerCount: number;
-  players: GamePlayerSummary[];
-  currentTurnSeat: number | null;
-  turnEndsAt: number | null;
-}
-
 interface GameRoomStub {
   createGame(
     gameId: string,
@@ -101,7 +92,7 @@ interface GameRoomStub {
     gameType: GameType
   ): Promise<unknown>;
   addPlayer(playerId: string): Promise<unknown>;
-  getGameState(): Promise<GameStateSummary | null>;
+  syncMatchSnapshot(): Promise<void>;
   clearGame(): Promise<void>;
 }
 
@@ -114,7 +105,6 @@ export interface Env {
 }
 
 const MATCHMAKER_NAME = "global";
-const GAME_STATUS_FINISHED = 2;
 const POLL_AFTER_MS = 1_000;
 const QUEUED_TICKET_TTL_MS = 30_000;
 const MATCH_RESULT_TTL_MS = 10 * 60_000;
@@ -193,8 +183,6 @@ export class Matchmaker extends DurableObject<Env> {
       await this.saveState();
     }
 
-    // Existing games do not block matchmaking. A player may have many active
-    // Live/Persistent matches, while still having only one queued request.
     const existing = this.findActiveTicketForPlayer(request.playerId);
     if (existing) {
       if (
@@ -292,43 +280,30 @@ export class Matchmaker extends DurableObject<Env> {
       this.env.MATCH_DB,
       playerId
     );
-    const matches: PlayerMatchSummary[] = [];
 
-    for (const record of tracked) {
-      const room = this.env.GAME_ROOM.getByName(record.gameId) as unknown as GameRoomStub;
-      const state = await room.getGameState();
+    return tracked.map(record => {
+      const localPlayer = record.players.find(player => player.id === playerId);
 
-      if (
-        !state ||
-        state.status === GAME_STATUS_FINISHED ||
-        !state.players.some(player => player.id === playerId)
-      ) {
-        await removeActiveMatch(this.env.MATCH_DB, record.gameId);
-        continue;
-      }
-
-      const localPlayer = state.players.find(player => player.id === playerId);
-      matches.push({
-        gameId: state.gameId,
-        gameType: state.gameType,
-        status: state.status,
-        playerCount: state.playerCount,
-        players: state.players,
-        currentTurnSeat: state.currentTurnSeat,
-        turnEndsAt: state.turnEndsAt,
+      return {
+        gameId: record.gameId,
+        gameType: record.gameType as GameType,
+        status: record.status,
+        playerCount: record.playerCount,
+        players: record.players,
+        currentTurnSeat: record.currentTurnSeat,
+        turnEndsAt: record.turnEndsAt,
         isYourTurn:
-          localPlayer?.seat !== undefined &&
-          localPlayer.seat === state.currentTurnSeat,
+          localPlayer !== undefined &&
+          localPlayer.seat === record.currentTurnSeat,
         websocketUrl: buildGameWebSocketUrl(
           this.env.GAME_SERVER_URL,
-          state.gameId,
+          record.gameId,
           playerId
         ),
-        matchedAt: record.matchedAt
-      });
-    }
-
-    return matches.sort((a, b) => b.matchedAt - a.matchedAt);
+        matchedAt: record.matchedAt,
+        updatedAt: record.updatedAt
+      };
+    });
   }
 
   async cancel(ticketId: string, playerId: string): Promise<"cancelled" | "matched" | "not-found"> {
@@ -409,6 +384,8 @@ export class Matchmaker extends DurableObject<Env> {
         players,
         matchedAt
       });
+
+      await room.syncMatchSnapshot();
 
       for (const ticket of matched) {
         this.tickets.delete(ticket.ticketId);
