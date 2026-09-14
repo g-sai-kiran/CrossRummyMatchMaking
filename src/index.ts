@@ -2,7 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 import {
   createActiveMatch,
   listActiveMatchesForPlayer,
-  removeActiveMatch
+  removeActiveMatch,
+  StoredBoardPreview
 } from "./match-store";
 
 export enum GameType {
@@ -54,6 +55,7 @@ interface PlayerMatchSummary {
   websocketUrl: string;
   matchedAt: number;
   updatedAt: number;
+  boardPreview: StoredBoardPreview | null;
 }
 
 interface QueuedResponse {
@@ -301,7 +303,8 @@ export class Matchmaker extends DurableObject<Env> {
           playerId
         ),
         matchedAt: record.matchedAt,
-        updatedAt: record.updatedAt
+        updatedAt: record.updatedAt,
+        boardPreview: record.boardPreview
       };
     });
   }
