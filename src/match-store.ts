@@ -4,6 +4,22 @@ export interface StoredMatchPlayer {
   score: number;
 }
 
+export interface StoredBoardPreviewCoin {
+  x: number;
+  y: number;
+  type: number;
+  color: number | null;
+  number: number | null;
+  ownerSeat: number | null;
+}
+
+export interface StoredBoardPreview {
+  width: number;
+  height: number;
+  revision: number;
+  coins: StoredBoardPreviewCoin[];
+}
+
 export interface StoredActiveMatch {
   gameId: string;
   gameType: number;
@@ -13,6 +29,7 @@ export interface StoredActiveMatch {
   turnEndsAt: number | null;
   matchedAt: number;
   updatedAt: number;
+  boardPreview: StoredBoardPreview | null;
   players: StoredMatchPlayer[];
 }
 
@@ -33,6 +50,7 @@ interface ActiveMatchPlayerRow {
   turn_ends_at: number | null;
   matched_at: number;
   updated_at: number;
+  board_preview: string | null;
   player_id: string;
   seat: number;
   score: number;
@@ -59,8 +77,9 @@ export async function createActiveMatch(
         current_turn_seat,
         turn_ends_at,
         matched_at,
-        updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        updated_at,
+        board_preview
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       input.gameId,
       input.gameType,
@@ -69,7 +88,8 @@ export async function createActiveMatch(
       null,
       null,
       input.matchedAt,
-      input.matchedAt
+      input.matchedAt,
+      null
     )
   ];
 
@@ -108,6 +128,7 @@ export async function listActiveMatchesForPlayer(
       m.turn_ends_at,
       m.matched_at,
       m.updated_at,
+      m.board_preview,
       p.player_id,
       p.seat,
       p.score
@@ -140,6 +161,7 @@ export async function listActiveMatchesForPlayer(
         turnEndsAt: row.turn_ends_at,
         matchedAt: row.matched_at,
         updatedAt: row.updated_at,
+        boardPreview: parseBoardPreview(row.board_preview),
         players: []
       };
       matches.set(row.game_id, match);
@@ -167,4 +189,28 @@ export async function removeActiveMatch(
       "DELETE FROM active_matches WHERE game_id = ?"
     ).bind(gameId)
   ]);
+}
+
+function parseBoardPreview(value: string | null): StoredBoardPreview | null {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as StoredBoardPreview;
+    if (
+      !parsed ||
+      !Number.isInteger(parsed.width) ||
+      !Number.isInteger(parsed.height) ||
+      !Number.isInteger(parsed.revision) ||
+      !Array.isArray(parsed.coins)
+    ) {
+      return null;
+    }
+
+    return parsed;
+  }
+  catch {
+    return null;
+  }
 }
