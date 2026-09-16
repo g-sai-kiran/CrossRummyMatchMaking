@@ -5,6 +5,7 @@ import {
   removeActiveMatch,
   StoredBoardPreview
 } from "./match-store";
+import { listMatchHistoryForPlayer } from "./match-history-store";
 
 export enum GameType {
   Live = 0,
@@ -307,6 +308,18 @@ export class Matchmaker extends DurableObject<Env> {
         boardPreview: record.boardPreview
       };
     });
+  }
+
+  async getPlayerMatchHistory(playerId: string, limit: number) {
+    if (!playerId.trim()) {
+      throw new HttpError(400, "playerId is required");
+    }
+
+    return listMatchHistoryForPlayer(
+      this.env.MATCH_DB,
+      playerId,
+      limit
+    );
   }
 
   async cancel(ticketId: string, playerId: string): Promise<"cancelled" | "matched" | "not-found"> {
@@ -615,6 +628,29 @@ export default {
         }
 
         const matches = await matchmaker.getPlayerMatches(playerId);
+        return json({
+          playerId,
+          matches,
+          count: matches.length
+        }, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/match-history") {
+        const playerId = url.searchParams.get("playerId")?.trim();
+        if (!playerId) {
+          throw new HttpError(400, "playerId is required");
+        }
+
+        const rawLimit = url.searchParams.get("limit");
+        const parsedLimit = rawLimit === null ? 50 : Number(rawLimit);
+        if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) {
+          throw new HttpError(400, "limit must be an integer between 1 and 100");
+        }
+
+        const matches = await matchmaker.getPlayerMatchHistory(
+          playerId,
+          parsedLimit
+        );
         return json({
           playerId,
           matches,
