@@ -322,11 +322,10 @@ MATCH_DB   -> D1 database cross-rummy-matches
 
 ## Migrations
 
-Current migrations:
+Current migrations include active-match, history, retention, and result-stat schemas. End-game statistics are added by:
 
 ```text
-0001_active_matches.sql
-0002_match_snapshots.sql
+0006_end_game_stats.sql
 ```
 
 Apply migrations before deploying code that expects the new columns:
