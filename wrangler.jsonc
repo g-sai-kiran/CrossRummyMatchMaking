@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "cross-rummy-matchmaking",
-  "main": "src/index.ts",
+  "main": "src/entry.ts",
   "compatibility_date": "2026-08-31",
   "vars": {
     "GAME_SERVER_URL": "https://board-game-server.g-saikirangoud99740.workers.dev",
