@@ -2,6 +2,11 @@ export interface StoredMatchHistoryPlayer {
   id: string;
   seat: number;
   score: number;
+  turnsTaken: number;
+  bestTurnScore: number;
+  coinsPlaced: number;
+  result: "win" | "loss" | "draw";
+  rankDelta: number;
 }
 
 export interface StoredMatchHistoryBoardPreviewCoin {
@@ -26,7 +31,9 @@ export interface StoredMatchHistory {
   status: number;
   playerCount: number;
   matchedAt: number;
+  startedAt: number;
   finishedAt: number;
+  durationMs: number;
   boardPreview: StoredMatchHistoryBoardPreview | null;
   players: StoredMatchHistoryPlayer[];
 }
@@ -43,11 +50,18 @@ interface MatchHistoryPlayerRow {
   status: number;
   player_count: number;
   matched_at: number;
+  started_at: number | null;
   finished_at: number;
+  duration_ms: number | null;
   board_preview: string;
   player_id: string;
   seat: number;
   score: number;
+  turns_taken: number;
+  best_turn_score: number;
+  coins_placed: number;
+  result: "win" | "loss" | "draw";
+  rank_delta: number;
 }
 
 interface CursorParts {
@@ -117,11 +131,18 @@ export async function listMatchHistoryForPlayer(
       h.status,
       h.player_count,
       h.matched_at,
+      h.started_at,
       h.finished_at,
+      h.duration_ms,
       h.board_preview,
       p.player_id,
       p.seat,
-      p.score
+      p.score,
+      p.turns_taken,
+      p.best_turn_score,
+      p.coins_placed,
+      p.result,
+      p.rank_delta
     FROM match_history AS h
     INNER JOIN match_history_players AS p
       ON p.game_id = h.game_id
@@ -142,7 +163,14 @@ export async function listMatchHistoryForPlayer(
         status: row.status,
         playerCount: row.player_count,
         matchedAt: row.matched_at,
+        startedAt: row.started_at ?? row.matched_at,
         finishedAt: row.finished_at,
+        durationMs:
+          row.duration_ms ??
+          Math.max(
+            0,
+            row.finished_at - (row.started_at ?? row.matched_at)
+          ),
         boardPreview: parseBoardPreview(row.board_preview),
         players: []
       };
@@ -152,7 +180,12 @@ export async function listMatchHistoryForPlayer(
     match.players.push({
       id: row.player_id,
       seat: row.seat,
-      score: row.score
+      score: row.score,
+      turnsTaken: row.turns_taken,
+      bestTurnScore: row.best_turn_score,
+      coinsPlaced: row.coins_placed,
+      result: row.result,
+      rankDelta: row.rank_delta
     });
   }
 
