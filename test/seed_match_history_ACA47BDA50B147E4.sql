@@ -4,6 +4,7 @@
 -- npx wrangler d1 execute cross-rummy-matches --remote --file=./test/seed_match_history_ACA47BDA50B147E4.sql
 --
 -- Safe to re-run: existing rows with this test prefix are deleted first.
+-- Requires D1 migrations through 0006_end_game_stats.sql to be applied first.
 PRAGMA foreign_keys = ON;
 
 
