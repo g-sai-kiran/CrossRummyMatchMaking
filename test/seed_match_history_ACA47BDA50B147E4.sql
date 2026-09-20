@@ -6,7 +6,6 @@
 -- Safe to re-run: existing rows with this test prefix are deleted first.
 PRAGMA foreign_keys = ON;
 
-BEGIN TRANSACTION;
 
 DELETE FROM match_history
 WHERE game_id LIKE 'ui-test-ACA47BDA50B147E4-%';
@@ -311,7 +310,6 @@ INSERT INTO match_history_players (
 INSERT INTO match_history_access (game_id, player_id, finished_at)
 VALUES ('ui-test-ACA47BDA50B147E4-15', 'ACA47BDA50B147E4', 1789579800000);
 
-COMMIT;
 
 -- Optional verification:
 -- SELECT game_id, finished_at FROM match_history_access
