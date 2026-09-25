@@ -105,6 +105,11 @@ export interface Env {
   MATCH_DB: D1Database;
   GAME_SERVER_URL: string;
   CORS_ORIGIN?: string;
+  CR_TITLEID: string;
+  CR_PLAYFAB_SECRET: string;
+  FCM_PROJECT_ID?: string;
+  FCM_CLIENT_EMAIL?: string;
+  FCM_PRIVATE_KEY?: string;
 }
 
 const MATCHMAKER_NAME = "global";

@@ -378,3 +378,12 @@ Use the returned `websocketUrl` directly in Unity.
 - The queue itself still uses one global Matchmaker Durable Object.
 - If queue traffic becomes large, shard matchmaking by game type, player count, region, or rank bucket.
 - Player identity should eventually be validated server-side instead of trusting the client-supplied ID.
+
+
+## Game invites and push notifications
+
+Invites use the same Worker and `cross-rummy-matches` D1 database. The invite is persisted first, and Firebase Cloud Messaging is used only as a best-effort wake-up/notification channel.
+
+Invite/device endpoints authenticate the caller with the PlayFab session ticket instead of trusting a client-supplied player ID.
+
+See [docs/INVITES.md](docs/INVITES.md) for the D1 schema, Firebase secrets, API examples, Unity flow, and deployment steps.
