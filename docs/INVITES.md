@@ -228,6 +228,24 @@ Authorization: Bearer <session-ticket>
 
 Only invite members can read it.
 
+When the invite has started, this endpoint also returns the current player's match connection data:
+
+```json
+{
+  "invite": {
+    "status": "started",
+    "gameId": "..."
+  },
+  "match": {
+    "gameId": "...",
+    "players": ["...", "..."],
+    "websocketUrl": "wss://..."
+  }
+}
+```
+
+That makes polling sufficient to enter a match on Steam/WebGL even if no push notification is available.
+
 While the lobby UI is open, poll every **2 seconds**:
 
 ```text
