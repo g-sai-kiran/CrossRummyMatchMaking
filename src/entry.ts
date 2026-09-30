@@ -15,7 +15,7 @@ import {
   unregisterPushDevice
 } from "./invite-store";
 import { AuthenticationError, requirePlayerId } from "./playfab-auth";
-import { createMatchForInvite } from "./invite-service";
+import { buildGameWebSocketUrl, createMatchForInvite } from "./invite-service";
 import { sendPushToPlayer } from "./push";
 
 export { Matchmaker };
@@ -464,7 +464,24 @@ export default {
           decodeURIComponent(inviteMatch[1])
         );
         ensureInviteMember(invite, playerId);
-        return json({ invite }, env);
+
+        const match =
+          invite?.status === "started" && invite.gameId
+            ? {
+                gameId: invite.gameId,
+                players: invite.members
+                  .slice()
+                  .sort((a, b) => a.seat - b.seat)
+                  .map(member => member.playerId),
+                websocketUrl: buildGameWebSocketUrl(
+                  env.GAME_SERVER_URL,
+                  invite.gameId,
+                  playerId
+                )
+              }
+            : undefined;
+
+        return json({ invite, match }, env);
       }
 
       const actionMatch = url.pathname.match(
