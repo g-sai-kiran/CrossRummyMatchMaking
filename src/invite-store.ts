@@ -405,6 +405,41 @@ export async function listPushInstallations(
 }
 
 
+const JOIN_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const JOIN_CODE_LENGTH = 6;
+
+function generateJoinCode(): string {
+  const bytes = new Uint8Array(JOIN_CODE_LENGTH);
+  crypto.getRandomValues(bytes);
+  return Array.from(
+    bytes,
+    value => JOIN_CODE_ALPHABET[value % JOIN_CODE_ALPHABET.length]
+  ).join("");
+}
+
+export async function createOpenInvite(
+  db: D1Database,
+  input: Omit<CreateInviteInput, "inviteePlayerIds" | "joinCode">
+): Promise<GameInvite> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const joinCode = generateJoinCode();
+    try {
+      return await createInvite(db, {
+        ...input,
+        inviteePlayerIds: [],
+        joinCode
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.toLowerCase().includes("unique")) {
+        throw error;
+      }
+    }
+  }
+
+  throw new Error("Could not generate a unique join code");
+}
+
 export async function getInviteByJoinCode(
   db: D1Database,
   joinCode: string
