@@ -23,6 +23,7 @@ export interface GameInvite {
   playerCount: number;
   status: InviteStatus;
   gameId: string | null;
+  joinCode: string | null;
   createdAt: number;
   expiresAt: number;
   updatedAt: number;
@@ -36,6 +37,7 @@ interface InviteRow {
   player_count: number;
   status: InviteStatus;
   game_id: string | null;
+  join_code: string | null;
   created_at: number;
   expires_at: number;
   updated_at: number;
@@ -55,6 +57,7 @@ export interface CreateInviteInput {
   gameType: number;
   playerCount: number;
   expiresAt: number;
+  joinCode?: string | null;
 }
 
 export interface InviteResponseResult {
@@ -88,15 +91,17 @@ export async function createInvite(
         game_type,
         player_count,
         status,
+        join_code,
         created_at,
         expires_at,
         updated_at
-      ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`
     ).bind(
       inviteId,
       input.hostPlayerId,
       input.gameType,
       input.playerCount,
+      input.joinCode ?? null,
       now,
       input.expiresAt,
       now
@@ -141,6 +146,7 @@ export async function getInvite(
       player_count,
       status,
       game_id,
+      join_code,
       created_at,
       expires_at,
       updated_at
@@ -166,6 +172,7 @@ export async function getInvite(
     playerCount: row.player_count,
     status: row.status,
     gameId: row.game_id,
+    joinCode: row.join_code,
     createdAt: row.created_at,
     expiresAt: row.expires_at,
     updatedAt: row.updated_at,
@@ -396,4 +403,155 @@ export async function listPushInstallations(
   ).bind(playerId).all<{ installation_id: string }>();
 
   return rows.results.map(row => row.installation_id);
+}
+
+
+const JOIN_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const JOIN_CODE_LENGTH = 6;
+
+function generateJoinCode(): string {
+  const bytes = new Uint8Array(JOIN_CODE_LENGTH);
+  crypto.getRandomValues(bytes);
+  return Array.from(
+    bytes,
+    value => JOIN_CODE_ALPHABET[value % JOIN_CODE_ALPHABET.length]
+  ).join("");
+}
+
+export async function createOpenInvite(
+  db: D1Database,
+  input: Omit<CreateInviteInput, "inviteePlayerIds" | "joinCode">
+): Promise<GameInvite> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const joinCode = generateJoinCode();
+    try {
+      return await createInvite(db, {
+        ...input,
+        inviteePlayerIds: [],
+        joinCode
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.toLowerCase().includes("unique")) {
+        throw error;
+      }
+    }
+  }
+
+  throw new Error("Could not generate a unique join code");
+}
+
+export async function getInviteByJoinCode(
+  db: D1Database,
+  joinCode: string
+): Promise<GameInvite | null> {
+  await expireOldInvites(db);
+
+  const row = await db.prepare(
+    `SELECT invite_id
+     FROM game_invites
+     WHERE join_code = ?`
+  ).bind(joinCode).first<{ invite_id: string }>();
+
+  return row ? getInvite(db, row.invite_id) : null;
+}
+
+export async function joinOpenInvite(
+  db: D1Database,
+  joinCode: string,
+  playerId: string
+): Promise<InviteResponseResult | null> {
+  let invite = await getInviteByJoinCode(db, joinCode);
+  if (!invite) {
+    return null;
+  }
+
+  if (invite.status === "started" || invite.status === "starting") {
+    return { invite, becameReady: false };
+  }
+
+  if (invite.status !== "pending") {
+    return { invite, becameReady: false };
+  }
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const existing = invite.members.find(
+      member => member.playerId === playerId
+    );
+    if (existing) {
+      break;
+    }
+
+    if (invite.members.length >= invite.playerCount) {
+      return { invite, becameReady: false };
+    }
+
+    const usedSeats = new Set(invite.members.map(member => member.seat));
+    let seat = 1;
+    while (seat < invite.playerCount && usedSeats.has(seat)) {
+      seat++;
+    }
+
+    if (seat >= invite.playerCount || usedSeats.has(seat)) {
+      return { invite, becameReady: false };
+    }
+
+    const now = Date.now();
+    try {
+      await db.prepare(
+        `INSERT INTO game_invite_members (
+          invite_id, player_id, seat, role, status, responded_at
+        ) VALUES (?, ?, ?, 'invitee', 'accepted', ?)`
+      ).bind(invite.inviteId, playerId, seat, now).run();
+      break;
+    } catch {
+      const refreshedAfterRace = await getInvite(db, invite.inviteId);
+      if (!refreshedAfterRace) {
+        return null;
+      }
+
+      invite = refreshedAfterRace;
+
+      if (invite.status !== "pending") {
+        return { invite, becameReady: false };
+      }
+
+      if (invite.members.some(member => member.playerId === playerId)) {
+        break;
+      }
+    }
+  }
+
+  invite = await getInvite(db, invite.inviteId);
+  if (!invite) {
+    return null;
+  }
+
+  if (!invite.members.some(member => member.playerId === playerId)) {
+    return { invite, becameReady: false };
+  }
+
+  const now = Date.now();
+  const readyUpdate = await db.prepare(
+    `UPDATE game_invites
+     SET status = 'starting', updated_at = ?
+     WHERE invite_id = ?
+       AND status = 'pending'
+       AND (
+         SELECT COUNT(*)
+         FROM game_invite_members
+         WHERE invite_id = ?
+           AND status = 'accepted'
+       ) = player_count`
+  ).bind(now, invite.inviteId, invite.inviteId).run();
+
+  const refreshed = await getInvite(db, invite.inviteId);
+  if (!refreshed) {
+    return null;
+  }
+
+  return {
+    invite: refreshed,
+    becameReady: (readyUpdate.meta.changes ?? 0) > 0
+  };
 }

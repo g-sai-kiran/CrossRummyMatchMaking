@@ -4,8 +4,10 @@ import {
   acceptInvite,
   cancelInvite,
   createInvite,
+  createOpenInvite,
   declineInvite,
   getInvite,
+  joinOpenInvite,
   listInvitesForPlayer,
   markInviteStarted,
   registerPushDevice,
@@ -13,7 +15,7 @@ import {
   unregisterPushDevice
 } from "./invite-store";
 import { AuthenticationError, requirePlayerId } from "./playfab-auth";
-import { createMatchForInvite } from "./invite-service";
+import { buildGameWebSocketUrl, createMatchForInvite } from "./invite-service";
 import { sendPushToPlayer } from "./push";
 
 export { Matchmaker };
@@ -26,6 +28,12 @@ class HttpError extends Error {
 
 interface CreateInviteBody {
   inviteePlayerIds?: string[];
+  gameType?: number;
+  playerCount?: number;
+  expiresInSeconds?: number;
+}
+
+interface CreateOpenInviteBody {
   gameType?: number;
   playerCount?: number;
   expiresInSeconds?: number;
@@ -119,6 +127,49 @@ function validateCreateInvite(
     playerCount,
     expiresAt: Date.now() + expiresInSeconds * 1000
   };
+}
+
+
+function validateOpenInvite(
+  body: CreateOpenInviteBody
+): {
+  gameType: number;
+  playerCount: number;
+  expiresAt: number;
+} {
+  if (body.gameType !== 0 && body.gameType !== 1) {
+    throw new HttpError(400, "gameType must be 0 (Live) or 1 (Persistent)");
+  }
+
+  if (
+    !Number.isInteger(body.playerCount) ||
+    (body.playerCount ?? 0) < 2 ||
+    (body.playerCount ?? 0) > 4
+  ) {
+    throw new HttpError(400, "playerCount must be between 2 and 4");
+  }
+
+  const expiresInSeconds = body.expiresInSeconds ?? 600;
+  if (
+    !Number.isInteger(expiresInSeconds) ||
+    expiresInSeconds < 30 ||
+    expiresInSeconds > 3600
+  ) {
+    throw new HttpError(
+      400,
+      "expiresInSeconds must be an integer between 30 and 3600"
+    );
+  }
+
+  return {
+    gameType: body.gameType,
+    playerCount: body.playerCount as number,
+    expiresAt: Date.now() + expiresInSeconds * 1000
+  };
+}
+
+function normalizeJoinCode(value: string): string {
+  return value.trim().toUpperCase();
 }
 
 function ensureInviteMember(
@@ -225,6 +276,132 @@ export default {
         return json({ status: "unregistered", installationId }, env);
       }
 
+
+      if (request.method === "POST" && url.pathname === "/invites/open") {
+        const playerId = await requirePlayerId(request, env);
+        const body = validateOpenInvite(
+          await parseJson<CreateOpenInviteBody>(request)
+        );
+
+        const invite = await createOpenInvite(env.MATCH_DB, {
+          hostPlayerId: playerId,
+          ...body
+        });
+
+        return json({
+          invite,
+          joinCode: invite.joinCode,
+          pollAfterMs: 2000
+        }, env, 201);
+      }
+
+      const joinCodeMatch = url.pathname.match(/^\/invites\/join\/([^/]+)$/);
+      if (request.method === "POST" && joinCodeMatch) {
+        const playerId = await requirePlayerId(request, env);
+        const joinCode = normalizeJoinCode(
+          decodeURIComponent(joinCodeMatch[1])
+        );
+
+        if (!/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{6}$/.test(joinCode)) {
+          throw new HttpError(400, "Invalid join code");
+        }
+
+        const result = await joinOpenInvite(
+          env.MATCH_DB,
+          joinCode,
+          playerId
+        );
+
+        if (!result) {
+          throw new HttpError(404, "Join code not found or expired");
+        }
+
+        if (
+          result.invite.status !== "pending" &&
+          result.invite.status !== "starting" &&
+          result.invite.status !== "started"
+        ) {
+          throw new HttpError(
+            409,
+            `Invite is already ${result.invite.status}`
+          );
+        }
+
+        const joined = result.invite.members.some(
+          member => member.playerId === playerId
+        );
+        if (!joined) {
+          throw new HttpError(409, "Invite is full");
+        }
+
+        if (result.becameReady) {
+          try {
+            const match = await createMatchForInvite(env, result.invite);
+            const invite = await markInviteStarted(
+              env.MATCH_DB,
+              result.invite.inviteId,
+              match.gameId
+            );
+
+            for (const matchPlayerId of match.players) {
+              ctx.waitUntil(
+                sendPushToPlayer(
+                  env.MATCH_DB,
+                  env,
+                  matchPlayerId,
+                  "Cross Rummy",
+                  "Your invited match is ready.",
+                  {
+                    type: "invite_match_started",
+                    inviteId: result.invite.inviteId,
+                    gameId: match.gameId,
+                    websocketUrl: match.websocketUrls[matchPlayerId]
+                  }
+                )
+              );
+            }
+
+            return json({
+              invite,
+              match: {
+                gameId: match.gameId,
+                players: match.players,
+                websocketUrl: match.websocketUrls[playerId]
+              },
+              pollAfterMs: 2000
+            }, env);
+          } catch (error) {
+            await revertInviteStarting(
+              env.MATCH_DB,
+              result.invite.inviteId
+            );
+            throw error;
+          }
+        }
+
+        if (playerId !== result.invite.hostPlayerId) {
+          ctx.waitUntil(
+            sendPushToPlayer(
+              env.MATCH_DB,
+              env,
+              result.invite.hostPlayerId,
+              "Cross Rummy",
+              "A player joined your game lobby.",
+              {
+                type: "invite_joined",
+                inviteId: result.invite.inviteId,
+                playerId
+              }
+            )
+          );
+        }
+
+        return json({
+          invite: result.invite,
+          pollAfterMs: 2000
+        }, env);
+      }
+
       if (request.method === "POST" && url.pathname === "/invites") {
         const playerId = await requirePlayerId(request, env);
         const body = validateCreateInvite(
@@ -287,7 +464,24 @@ export default {
           decodeURIComponent(inviteMatch[1])
         );
         ensureInviteMember(invite, playerId);
-        return json({ invite }, env);
+
+        const match =
+          invite?.status === "started" && invite.gameId
+            ? {
+                gameId: invite.gameId,
+                players: invite.members
+                  .slice()
+                  .sort((a, b) => a.seat - b.seat)
+                  .map(member => member.playerId),
+                websocketUrl: buildGameWebSocketUrl(
+                  env.GAME_SERVER_URL,
+                  invite.gameId,
+                  playerId
+                )
+              }
+            : undefined;
+
+        return json({ invite, match }, env);
       }
 
       const actionMatch = url.pathname.match(
