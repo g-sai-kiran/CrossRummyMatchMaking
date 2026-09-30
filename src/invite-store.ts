@@ -91,6 +91,7 @@ export async function createInvite(
         game_type,
         player_count,
         status,
+        join_code,
         created_at,
         expires_at,
         updated_at
@@ -460,7 +461,7 @@ export async function joinOpenInvite(
   joinCode: string,
   playerId: string
 ): Promise<InviteResponseResult | null> {
-  const invite = await getInviteByJoinCode(db, joinCode);
+  let invite = await getInviteByJoinCode(db, joinCode);
   if (!invite) {
     return null;
   }
@@ -473,19 +474,25 @@ export async function joinOpenInvite(
     return { invite, becameReady: false };
   }
 
-  const existing = invite.members.find(member => member.playerId === playerId);
-  if (!existing) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const existing = invite.members.find(
+      member => member.playerId === playerId
+    );
+    if (existing) {
+      break;
+    }
+
     if (invite.members.length >= invite.playerCount) {
       return { invite, becameReady: false };
     }
 
     const usedSeats = new Set(invite.members.map(member => member.seat));
     let seat = 1;
-    while (usedSeats.has(seat) && seat < invite.playerCount) {
+    while (seat < invite.playerCount && usedSeats.has(seat)) {
       seat++;
     }
 
-    if (seat >= invite.playerCount && usedSeats.has(seat)) {
+    if (seat >= invite.playerCount || usedSeats.has(seat)) {
       return { invite, becameReady: false };
     }
 
@@ -496,18 +503,32 @@ export async function joinOpenInvite(
           invite_id, player_id, seat, role, status, responded_at
         ) VALUES (?, ?, ?, 'invitee', 'accepted', ?)`
       ).bind(invite.inviteId, playerId, seat, now).run();
+      break;
     } catch {
       const refreshedAfterRace = await getInvite(db, invite.inviteId);
       if (!refreshedAfterRace) {
         return null;
       }
-      const raceMember = refreshedAfterRace.members.find(
-        member => member.playerId === playerId
-      );
-      if (!raceMember) {
-        return { invite: refreshedAfterRace, becameReady: false };
+
+      invite = refreshedAfterRace;
+
+      if (invite.status !== "pending") {
+        return { invite, becameReady: false };
+      }
+
+      if (invite.members.some(member => member.playerId === playerId)) {
+        break;
       }
     }
+  }
+
+  invite = await getInvite(db, invite.inviteId);
+  if (!invite) {
+    return null;
+  }
+
+  if (!invite.members.some(member => member.playerId === playerId)) {
+    return { invite, becameReady: false };
   }
 
   const now = Date.now();
