@@ -23,7 +23,7 @@ export interface DirectInviteMatch {
   websocketUrls: Record<string, string>;
 }
 
-function buildGameWebSocketUrl(
+export function buildGameWebSocketUrl(
   baseUrl: string,
   gameId: string,
   playerId: string
