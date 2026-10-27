@@ -105,6 +105,7 @@ export interface Env {
   MATCH_DB: D1Database;
   GAME_SERVER_URL: string;
   CORS_ORIGIN?: string;
+  ANDROID_APP_SHA256_FINGERPRINTS?: string;
   CR_TITLEID: string;
   CR_PLAYFAB_SECRET: string;
   FCM_PROJECT_ID?: string;
