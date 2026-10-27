@@ -1,3 +1,4 @@
+import { handlePublicAppLink } from "./app-links";
 import handler, { Env, Matchmaker } from "./index";
 import { listMatchHistoryForPlayer } from "./match-history-store";
 import {
@@ -188,6 +189,9 @@ export default {
     ctx: ExecutionContext
   ): Promise<Response> {
     const url = new URL(request.url);
+
+    const publicAppLink = handlePublicAppLink(request, env);
+    if (publicAppLink) return publicAppLink;
 
     if (request.method === "OPTIONS") {
       return new Response(null, {

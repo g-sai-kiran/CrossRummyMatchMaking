@@ -105,8 +105,9 @@ export interface Env {
   MATCH_DB: D1Database;
   GAME_SERVER_URL: string;
   CORS_ORIGIN?: string;
-  CR_TITLEID: string;
-  CR_PLAYFAB_SECRET: string;
+  ANDROID_APP_SHA256_FINGERPRINTS?: string;
+  CR_TITLEID: import("./secret-binding").SecretBinding;
+  CR_PLAYFAB_SECRET: import("./secret-binding").SecretBinding;
   FCM_PROJECT_ID?: string;
   FCM_CLIENT_EMAIL?: string;
   FCM_PRIVATE_KEY?: string;
@@ -652,14 +653,16 @@ export default {
           throw new HttpError(400, "limit must be an integer between 1 and 100");
         }
 
-        const matches = await matchmaker.getPlayerMatchHistory(
+        const page = await matchmaker.getPlayerMatchHistory(
           playerId,
           parsedLimit
         );
         return json({
           playerId,
-          matches,
-          count: matches.length
+          matches: page.matches,
+          count: page.matches.length,
+          hasMore: page.hasMore,
+          nextCursor: page.nextCursor
         }, env);
       }
 
