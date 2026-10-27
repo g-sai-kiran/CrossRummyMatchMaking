@@ -653,14 +653,16 @@ export default {
           throw new HttpError(400, "limit must be an integer between 1 and 100");
         }
 
-        const matches = await matchmaker.getPlayerMatchHistory(
+        const page = await matchmaker.getPlayerMatchHistory(
           playerId,
           parsedLimit
         );
         return json({
           playerId,
-          matches,
-          count: matches.length
+          matches: page.matches,
+          count: page.matches.length,
+          hasMore: page.hasMore,
+          nextCursor: page.nextCursor
         }, env);
       }
 
