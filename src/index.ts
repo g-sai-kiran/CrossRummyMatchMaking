@@ -106,8 +106,8 @@ export interface Env {
   GAME_SERVER_URL: string;
   CORS_ORIGIN?: string;
   ANDROID_APP_SHA256_FINGERPRINTS?: string;
-  CR_TITLEID: string;
-  CR_PLAYFAB_SECRET: string;
+  CR_TITLEID: import("./secret-binding").SecretBinding;
+  CR_PLAYFAB_SECRET: import("./secret-binding").SecretBinding;
   FCM_PROJECT_ID?: string;
   FCM_CLIENT_EMAIL?: string;
   FCM_PRIVATE_KEY?: string;

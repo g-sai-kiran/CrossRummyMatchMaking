@@ -1,6 +1,7 @@
+import { readSecret, type SecretBinding } from "./secret-binding";
 export interface PlayFabAuthEnv {
-  CR_TITLEID: string;
-  CR_PLAYFAB_SECRET: string;
+  CR_TITLEID: SecretBinding;
+  CR_PLAYFAB_SECRET: SecretBinding;
 }
 
 export class AuthenticationError extends Error {
@@ -33,17 +34,20 @@ export async function requirePlayerId(
     throw new AuthenticationError("Authorization bearer token is required");
   }
 
-  if (!env.CR_TITLEID?.trim() || !env.CR_PLAYFAB_SECRET?.trim()) {
-    throw new Error("PlayFab server authentication is not configured");
+  const titleId = await readSecret(env.CR_TITLEID, "CR_TITLEID");
+  const secretKey = await readSecret(env.CR_PLAYFAB_SECRET, "CR_PLAYFAB_SECRET");
+
+  if (!/^[A-Za-z0-9]+$/.test(titleId)) {
+    throw new Error("Invalid PlayFab title ID binding");
   }
 
   const response = await fetch(
-    `https://${env.CR_TITLEID}.playfabapi.com/Server/AuthenticateSessionTicket`,
+    `https://${titleId}.playfabapi.com/Server/AuthenticateSessionTicket`,
     {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-secretkey": env.CR_PLAYFAB_SECRET
+        "x-secretkey": secretKey
       },
       body: JSON.stringify({
         SessionTicket: sessionTicket
